@@ -33,7 +33,7 @@ import SCC(scc)
 
 -- utility libs
 import ParseOp
-import PFPrint
+-- import PFPrint
 import Util(headOrErr, fromJustOrErr, joinByFst, quote)
 import FileNameUtil(baseName, hasDotSuf, dropSuf, dirName, mangleFileName,
                     mkAName, mkVName, mkVPICName,
@@ -167,10 +167,74 @@ import ISplitIf(iSplitIf)
 import VFileName
 import Language.LSP.Server
 import Language.LSP.Protocol.Message
-import Language.LSP.Protocol.Types
+import Language.LSP.Protocol.Types qualified as J
 import Control.Monad.IO.Class
 import Data.Text qualified as T
 
+
+-- args <- getArgs
+-- bsCatch (hmain args)
+handlers :: Handlers (LspM ())
+handlers =
+  mconcat
+    [ notificationHandler J.SInitialized $ \_not -> do
+        -- Maybe we should compile everything here?
+        return ()
+    , notificationHandler J.STextDocumentDidOpen $ \msg -> do
+        let doc = msg ^. J.params . J.textDocument . J.uri
+            content = msg ^. J.params . J.textDocument . J.text  -- Extract content first time file is opened
+        validateSwarmCode (J.toNormalizedUri doc) Nothing content
+    , notificationHandler J.STextDocumentDidChange $ \msg -> do -- GetContent from VFS
+        let doc = msg ^. J.params . J.textDocument . J.uri . to J.toNormalizedUri
+        mdoc <- getVirtualFile doc
+        case mdoc of
+          Just vf@(VirtualFile _ version _rope) -> do
+            validateSwarmCode doc (Just $ fromIntegral version) (virtualFileText vf)
+          _ -> debug $ "No virtual file found for: " <> from (show msg)
+    , notificationHandler J.STextDocumentDidSave $ \msg -> do -- Check what is being written
+        let doc = msg ^. J.params . J.textDocument . J.uri
+            content = fromMaybe "?" $ msg ^. J.params . J.text
+        validateSwarmCode (J.toNormalizedUri doc) Nothing content
+    , requestHandler J.STextDocumentDefinition $ \req responder -> do
+        let pos = req ^. J.params . J.position -- pos is a position in teh document
+            uri = req ^. J.params . J.textDocument . J.uri -- uri is the link of the document
+        normUri <- normalizeUriWithPath uri
+        store <- getStore
+        defs <- runMaybeT $ do
+            lift $ debugM $ "Looking up " <> J.getUri (J.fromNormalizedUri normUri) <> " in " <> T.pack (show (M.keys $ I.idxModules store))
+            entry <- I.getModule normUri
+            lift $ fetchDefinitions store entry pos
+        responder $ Right $ J.InR $ J.InR $ J.List $ fromMaybe [] defs
+    ]
+        
+    --      notificationHandler SMethod_Initialized $ \_not -> do
+    --     let params =
+    --           ShowMessageRequestParams
+    --             MessageType_Info
+    --             "Turn on code lenses?"
+    --             (Just [MessageActionItem "Turn on", MessageActionItem "Don't"])
+    --     _ <- sendRequest SMethod_WindowShowMessageRequest params $ \case
+    --       Right (InL (MessageActionItem "Turn on")) -> do
+    --         let regOpts = CodeLensRegistrationOptions (InR Null) Nothing (Just False)
+
+    --         _ <- registerCapability SMethod_TextDocumentCodeLens regOpts $ \_req responder -> do
+    --           let cmd = Command "Say hello" "lsp-hello-command" Nothing
+    --               rsp = [CodeLens (mkRange 0 0 0 100) (Just cmd) Nothing]
+    --           responder $ Right $ InL rsp
+    --         pure ()
+    --       Right _ ->
+    --         sendNotification SMethod_WindowShowMessage (ShowMessageParams MessageType_Info "Not turning on code lenses")
+    --       Left err ->
+    --         sendNotification SMethod_WindowShowMessage (ShowMessageParams MessageType_Error $ "Something went wrong!\n" <> T.pack (show err))
+    --     pure ()
+    -- , requestHandler SMethod_TextDocumentHover $ \req responder -> do
+    --     let TRequestMessage _ _ _ (HoverParams _doc pos _workDone) = req
+    --         Position _l _c' = pos
+    --         rsp = Hover (InL ms) (Just range)
+    --         ms = mkMarkdown "Hello world"
+    --         range = Range pos pos
+    --     responder (Right $ InL rsp)
+    -- ]
 
 --import Debug.Trace
 
@@ -180,9 +244,27 @@ main = do
     hSetBuffering stderr LineBuffering
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
-    args <- getArgs
+    runServer $
+        ServerDefinition { parseConfig = const $ const $ Right ()
+                         , onConfigChange = const $ pure ()
+                         , defaultConfig = ()
+                         , configSection = "demo"
+                         , doInitialize = \env _req -> pure $ Right env
+                         , staticHandlers = \_caps -> handlers
+                         , interpretHandler = \env -> Iso (runLspT env) liftIO
+                         , options = defaultOptions { -- set sync options to get DidSave event, as well as Open and Close events.
+                                             textDocumentSync =
+                                               Just
+                                                 ( J.TextDocumentSyncOptions
+                                                     (Just True)
+                                                     (Just syncKind)
+                                                     (Just False)
+                                                     (Just False)
+                                                     (Just . J.InR . J.SaveOptions $ Just True)
+                                                 ) }
+                         }
     -- bsc can raise exception,  catch them here  print the message and exit out.
-    bsCatch (hmain args)
+
 
 -- Use with hugs top level
 hmain :: [String] -> IO ()
@@ -321,9 +403,9 @@ compileFile errh flags binmap hashmap name_orig = do
         <- parseSrc (syntax == CLASSIC) errh flags True name file    
     -- [T]: In the case where there is a parsing error, what to do?
 
-    when (getIdString i /= baseName (dropSuf name)) $
-         bsWarning errh
-             [(noPosition, WFilePackageNameMismatch name_rel (pfpString i))]
+    -- when (getIdString i /= baseName (dropSuf name)) $
+    --      bsWarning errh
+    --          [(noPosition, WFilePackageNameMismatch name_rel (pfpString i))]
 
     -- dump CSyntax
     when (showCSyntax flags) (putStrLnF (show pkg))

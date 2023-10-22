@@ -7,7 +7,7 @@ import Language.LSP.Test
 main = runSession "bsc_lsp" fullCaps "testsuite/lsp" $ do
   doc <- openDoc "Test1.bsv" "bsv"
 
-  -- Use your favourite favourite combinators.
+  -- Use your favourite combinators.
   skipManyTill loggingNotification (count 1 publishDiagnosticsNotification)
 
   -- Send requests and notifications and receive responses
