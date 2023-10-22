@@ -220,6 +220,7 @@ bsWarningsAndErrors :: ErrorHandle -> [EMsg] -> [EMsg] -> [EMsg] -> IO ()
 bsWarningsAndErrors ref ws ds es =
     bsWarningsAndErrorsWithContext ref emptyContext ws ds es
 
+-- [T]: This is the place we need to modify to communicate to the LSP server
 bsWarningsAndErrorsWithContext :: ErrorHandle -> MsgContext ->
                                   [EMsg] -> [EMsg] -> [EMsg] -> IO ()
 bsWarningsAndErrorsWithContext ref ctx [] [] [] = do
