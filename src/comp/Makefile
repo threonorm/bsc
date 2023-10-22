@@ -143,6 +143,7 @@ PACKAGES = \
 	-package lsp \
 	-package lsp-test \
 	-package lsp-types \
+	-package lens \
 	$(GHCEXTRAPKGS)
 
 # GHC can compile either a single file (use GHCCOMPILEFLAGS) or

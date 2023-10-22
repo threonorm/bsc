@@ -166,79 +166,57 @@ import VVerilogDollar
 import ISplitIf(iSplitIf)
 import VFileName
 import Language.LSP.Server
-import Language.LSP.Protocol.Message
-import Language.LSP.Protocol.Types qualified as J
+import Language.LSP.Protocol.Message qualified as LSP
+import Language.LSP.Protocol.Types qualified as LSP
+import Language.LSP.Protocol.Lens qualified as LSP
 import Control.Monad.IO.Class
 import Data.Text qualified as T
+import Language.LSP.VFS qualified as VFS
+import Control.Lens ((^.), to) -- Convenient
+import Data.Maybe (fromMaybe)
 
 
+-- bsc_tc should update tc the content, it should also store the results, indexed by URI + version 
+-- What to do for the dependencies that are recompiled on-the-fly? Do we have an URI for them?
+bsc_tc = undefined
 -- args <- getArgs
 -- bsCatch (hmain args)
 handlers :: Handlers (LspM ())
 handlers =
   mconcat
-    [ notificationHandler J.SInitialized $ \_not -> do
+    [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
         -- Maybe we should compile everything here?
         return ()
-    , notificationHandler J.STextDocumentDidOpen $ \msg -> do
-        let doc = msg ^. J.params . J.textDocument . J.uri
-            content = msg ^. J.params . J.textDocument . J.text  -- Extract content first time file is opened
-        validateSwarmCode (J.toNormalizedUri doc) Nothing content
-    , notificationHandler J.STextDocumentDidChange $ \msg -> do -- GetContent from VFS
-        let doc = msg ^. J.params . J.textDocument . J.uri . to J.toNormalizedUri
+    , notificationHandler LSP.SMethod_TextDocumentDidOpen $ \msg -> do
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+            content = msg ^. LSP.params . LSP.textDocument . LSP.text  -- Extract content first time file is opened
+        bsc_tc (LSP.toNormalizedUri doc) Nothing content
+    , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri . to LSP.toNormalizedUri
         mdoc <- getVirtualFile doc
         case mdoc of
-          Just vf@(VirtualFile _ version _rope) -> do
-            validateSwarmCode doc (Just $ fromIntegral version) (virtualFileText vf)
-          _ -> debug $ "No virtual file found for: " <> from (show msg)
-    , notificationHandler J.STextDocumentDidSave $ \msg -> do -- Check what is being written
-        let doc = msg ^. J.params . J.textDocument . J.uri
-            content = fromMaybe "?" $ msg ^. J.params . J.text
-        validateSwarmCode (J.toNormalizedUri doc) Nothing content
-    , requestHandler J.STextDocumentDefinition $ \req responder -> do
-        let pos = req ^. J.params . J.position -- pos is a position in teh document
-            uri = req ^. J.params . J.textDocument . J.uri -- uri is the link of the document
-        normUri <- normalizeUriWithPath uri
-        store <- getStore
-        defs <- runMaybeT $ do
-            lift $ debugM $ "Looking up " <> J.getUri (J.fromNormalizedUri normUri) <> " in " <> T.pack (show (M.keys $ I.idxModules store))
-            entry <- I.getModule normUri
-            lift $ fetchDefinitions store entry pos
-        responder $ Right $ J.InR $ J.InR $ J.List $ fromMaybe [] defs
+          Just vf@(VFS.VirtualFile _ version _rope) -> do
+            bsc_tc doc (Just $ fromIntegral version) (VFS.virtualFileText vf)
+          _ -> undefined -- error
+    , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+            content = fromMaybe "?" $ msg ^. LSP.params . LSP.text
+        bsc_tc (LSP.toNormalizedUri doc) Nothing content
+    , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
+        let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
+            uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
+        -- Make a state monad that contains the compiled modules so far, query this big table 
+        -- Query all the compiled modules that are in scope and nonqualified, and ask for global symbols
+        -- Also query the VFS to get the current file, to know what identifier is at the position pos.
+        -- for that we will probably need to index what BSC produced, to build a table for the current file.
+        -- We will want ot build the indexed table (Identifier <-> [positions])
+        -- (Note: Could be several definitions?)
+        defs <- undefined
+        responder $ undefined
     ]
-        
-    --      notificationHandler SMethod_Initialized $ \_not -> do
-    --     let params =
-    --           ShowMessageRequestParams
-    --             MessageType_Info
-    --             "Turn on code lenses?"
-    --             (Just [MessageActionItem "Turn on", MessageActionItem "Don't"])
-    --     _ <- sendRequest SMethod_WindowShowMessageRequest params $ \case
-    --       Right (InL (MessageActionItem "Turn on")) -> do
-    --         let regOpts = CodeLensRegistrationOptions (InR Null) Nothing (Just False)
+     
 
-    --         _ <- registerCapability SMethod_TextDocumentCodeLens regOpts $ \_req responder -> do
-    --           let cmd = Command "Say hello" "lsp-hello-command" Nothing
-    --               rsp = [CodeLens (mkRange 0 0 0 100) (Just cmd) Nothing]
-    --           responder $ Right $ InL rsp
-    --         pure ()
-    --       Right _ ->
-    --         sendNotification SMethod_WindowShowMessage (ShowMessageParams MessageType_Info "Not turning on code lenses")
-    --       Left err ->
-    --         sendNotification SMethod_WindowShowMessage (ShowMessageParams MessageType_Error $ "Something went wrong!\n" <> T.pack (show err))
-    --     pure ()
-    -- , requestHandler SMethod_TextDocumentHover $ \req responder -> do
-    --     let TRequestMessage _ _ _ (HoverParams _doc pos _workDone) = req
-    --         Position _l _c' = pos
-    --         rsp = Hover (InL ms) (Just range)
-    --         ms = mkMarkdown "Hello world"
-    --         range = Range pos pos
-    --     responder (Right $ InL rsp)
-    -- ]
-
---import Debug.Trace
-
-main :: IO ()
+main :: IO Int
 main = do
     hSetBuffering stdout LineBuffering
     hSetBuffering stderr LineBuffering
@@ -253,14 +231,14 @@ main = do
                          , staticHandlers = \_caps -> handlers
                          , interpretHandler = \env -> Iso (runLspT env) liftIO
                          , options = defaultOptions { -- set sync options to get DidSave event, as well as Open and Close events.
-                                             textDocumentSync =
+                                             optTextDocumentSync =
                                                Just
-                                                 ( J.TextDocumentSyncOptions
+                                                 ( LSP.TextDocumentSyncOptions
                                                      (Just True)
-                                                     (Just syncKind)
+                                                     (Just LSP.TextDocumentSyncKind_Full) -- Easier for now, could try to play with incremental?
                                                      (Just False)
                                                      (Just False)
-                                                     (Just . J.InR . J.SaveOptions $ Just True)
+                                                     (Just . LSP.InR . LSP.SaveOptions $ Just True)
                                                  ) }
                          }
     -- bsc can raise exception,  catch them here  print the message and exit out.
