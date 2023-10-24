@@ -190,17 +190,26 @@ handlers =
     , notificationHandler LSP.SMethod_TextDocumentDidOpen $ \msg -> do
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             content = msg ^. LSP.params . LSP.textDocument . LSP.text  -- Extract content first time file is opened
+        -- Call "bsc -u filename", do we actually have the filename here, from doc?
+        -- We might need some yaml configuration file to know the paths toward the dependencies (if they are not local)
+        -- Then call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
+        -- per URI we should record the latest usable CPackage
         bsc_tc (LSP.toNormalizedUri doc) Nothing content
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri . to LSP.toNormalizedUri
         mdoc <- getVirtualFile doc
         case mdoc of
           Just vf@(VFS.VirtualFile _ version _rope) -> do
+            -- Then call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
+            -- per URI we should record the latest usable CPackage
             bsc_tc doc (Just $ fromIntegral version) (VFS.virtualFileText vf)
           _ -> undefined -- error
     , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             content = fromMaybe "?" $ msg ^. LSP.params . LSP.text
+            -- call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
+            -- then call bsc -u filename
+            -- per URI we should record the latest usable CPackage
         bsc_tc (LSP.toNormalizedUri doc) Nothing content
     , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
         let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
@@ -245,8 +254,8 @@ main = do
 
 
 -- Use with hugs top level
-hmain :: [String] -> IO ()
-hmain args = do
+hmain :: [String] -> String -> IO ()
+hmain args contentFile = do
     pprog <- getProgName
     cdir <- getEnvDef "BLUESPECDIR" dfltBluespecDir
     bscopts <- getEnvDef "BSC_OPTIONS" ""
@@ -282,84 +291,38 @@ hmain args = do
                  exitOK errh }
         DBlueSrc flags src ->
             do { setFlags flags; doWarnings; showPreamble flags;
-                 main' errh flags src;
+                 main' errh flags src contentFile;
                  exitOK errh }
        
 
-
-main' :: ErrorHandle -> Flags -> String -> IO ()
-main' errh flags name =  do
+main' :: ErrorHandle -> Flags -> String -> String -> IO ()
+main' errh flags name contentFile =  do
+    setErrorHandleFlags errh flags
     tStart <- getNow
-
     flags' <- checkSATFlags errh flags
 
     -- check system requirements
-    doSystemCheck errh
-
-    let comp = if updCheck flags'
-               then compile_with_deps
-               else compile_no_deps
-
-    success <- comp errh flags' name
+    -- doSystemCheck errh
+    let comp = compile_no_deps
+    success <- comp errh flags' name contentFile
 
     -- final verbose message
-    _ <- timestampStr flags' "total" tStart
-
     if success then
       return ()
      else
        exitFail errh
 
-compile_with_deps :: ErrorHandle -> Flags -> String -> IO (Bool)
-compile_with_deps errh flags name = do
-    let
-        verb = showUpds flags && not (quiet flags)
-        -- the flags to "compileFile" when re-compiling depended modules
-        flags_depend = flags { updCheck = False,
-                               genName = [],
-                               showCodeGen = verb }
-        -- the flags to "compileFile" when re-compiling this module
-        flags_this = flags_depend { genName = genName flags }
-        comp (success, binmap0, hashmap0) fn = do
-            when (verb) $ putStrLnF ("compiling " ++ fn)
-            let fl = if (fn == name)
-                     then flags_this
-                     else flags_depend
-            (cur_success, binmap, hashmap)
-                <- compileFile errh fl binmap0 hashmap0 fn
-            return (cur_success && success, binmap, hashmap)
-    when (verb) $ putStrLnF "checking package dependencies"
-
-    t <- getNow
-    let dumpnames = (baseName (dropSuf name), "", "")
-
-    -- get the list of depended files which need recompiling
-    start flags DFdepend
-    fs <- chkDeps errh flags name
-    _ <- dump errh flags t DFdepend dumpnames fs
-
-    -- compile them
-    (ok, _, _) <- foldM comp (True, M.empty, M.empty) fs
-
-    when (verb) $
-      if ok then
-          putStrLnF "All packages are up to date."
-      else putStrLnF "All packages compiled (some with errors)."
-
-    return ok
-
-compile_no_deps :: ErrorHandle -> Flags -> String -> IO (Bool)
-compile_no_deps errh flags name = do
-  (ok, _, _) <- compileFile errh flags M.empty M.empty name
+compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO (Bool)
+compile_no_deps errh flags name contentFile = do
+  (ok, _, _) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
   return ok
 
 -- returns whether the compile errored or not
-compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String ->
+compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String -> String ->
                IO (Bool, BinMap HeapData, HashMap)
-compileFile errh flags binmap hashmap name_orig = do
+compileFile errh flags binmap hashmap name_orig file = do
     pwd <- getCurrentDirectory
     let name = (createEncodedFullFilePath name_orig pwd)
-        name_rel = (getRelativeFilePath name)
 
     let syntax = (if      hasDotSuf bscSrcSuffix name then CLASSIC
                   else if hasDotSuf bseSrcSuffix name then ESE
@@ -367,30 +330,14 @@ compileFile errh flags binmap hashmap name_orig = do
     setSyntax syntax
 
     t <- getNow
-    let dumpnames = (baseName (dropSuf name), "", "")
-
-    start flags DFcpp
-    file <- doCPP errh flags name
-    _ <- dumpStr errh flags t DFcpp dumpnames file
-
     -- ===== the break point between file manipulation and compilation
 
-    -- We don't start and dump this stage because that is handled inside
-    -- the "parseSrc" function (since BSV parsing has multiple stages)
     (pkg@(CPackage i _ _ _ _ _), t)
-        <- parseSrc (syntax == CLASSIC) errh flags True name file    
+        <- parseSrc False errh flags True name file    
     -- [T]: In the case where there is a parsing error, what to do?
 
-    -- when (getIdString i /= baseName (dropSuf name)) $
-    --      bsWarning errh
-    --          [(noPosition, WFilePackageNameMismatch name_rel (pfpString i))]
-
-    -- dump CSyntax
-    when (showCSyntax flags) (putStrLnF (show pkg))
-    -- dump stats
-    stats flags DFparsed pkg
-
     let dumpnames = (baseName (dropSuf name), getIdString (unQualId i), "")
+    -- Now we can go to TC, but we need to do a few passes of compilation before that
     compilePackage errh flags dumpnames t binmap hashmap name pkg
 
 -------------------------------------------------------------------------
@@ -507,72 +454,11 @@ compilePackage
     -- Type check and insert dictionaries
     start flags DFtypecheck
     (mod, tcErrors) <- cTypeCheck errh flags symt minst
+    -- [T]: Here we have the tyupechecking errors we can return them to LSP client
     -- mod is actually never used!
     --putStr (ppReadable mod)
     t <- dump errh flags t DFtypecheck dumpnames mod
-
-    --when (early flags) $ return ()
-    let prefix = dirName name ++ "/"
-
-    -- Generate wrapper info for foreign function imports
-    -- (this always happens, even when not generating for modules)
-    start flags DFgenforeign
-    foreign_func_info <- genForeign errh flags prefix mod
-    t <- dump errh flags t DFgenforeign dumpnames foreign_func_info
-
--- TODO HERE Start interesting things
-    -- Generate VPI wrappers for foreign function imports
-    start flags DFgenVPI
-    blurb <- mkGenFileHeader flags
-    let ffuncs = map snd foreign_func_info
-    vpi_wrappers <- if (backend flags /= Just Verilog)
-                    then return []
-                    else if (useDPI flags)
-                         then genDPIWrappers errh flags prefix blurb ffuncs
-                         else genVPIWrappers errh flags prefix blurb ffuncs
-    t <- dump errh flags t DFgenVPI dumpnames vpi_wrappers
-
-    -- -- Simplify a little
-    start flags DFsimplified
-    let mod' = simplify flags mod
-    t <- dump errh flags t DFsimplified dumpnames mod'
-    stats flags DFsimplified mod'
-
-    -- Read binary interface files
-    start flags DFbinary
-    let (_, _, impsigs, binmods0, pkgsigs) =
-            let findFn i = fromJustOrErr "bsc: binmap" $ M.lookup i binmap
-                sorted_ps = [ getIdString i
-                               | CImpSign _ _ (CSignature i _ _ _) <- imps ]
-            in  unzip5 $ map findFn sorted_ps
-
-    -- injects the "magic" variables genC and genVerilog
-    -- should probably be done via primitives
-    -- XXX does this interact with signature matching
-    -- or will it be caught by flag-matching?
-    let adjEnv ::
-            [(String, IExpr a)] ->
-            (IPackage a) ->
-            (IPackage a)
-        adjEnv env (IPackage i lps ps ds)
-                            | getIdString i == "Prelude" =
-                    IPackage i lps ps (map adjDef ds)
-            where
-                adjDef (IDef i t x p) =
-                    case lookup (getIdString (unQualId i)) env of
-                        Just e ->  IDef i t e p
-                        Nothing -> IDef i t x p
-        adjEnv _ p = p
-
-    let
-        -- adjust the "raw" packages and then add back their signatures
-        -- so they can be put into the current IPackage for linking info
-        binmods = zip (map (adjEnv env) binmods0) pkgsigs
-
-    t <- dump errh flags t DFbinary dumpnames binmods
-    -- Generate the user-visible type signature
-    bi_sig <- genUserSign errh symt mctx
-
+    -- [T]: We should not use this function to compile the bo of thje submodule so here we are good.
 
     return ( not tcErrors, binmap, hashmap)
 
