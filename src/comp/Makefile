@@ -144,6 +144,8 @@ PACKAGES = \
 	-package lsp-test \
 	-package lsp-types \
 	-package lens \
+	-package aeson \
+	-package text-format \
 	$(GHCEXTRAPKGS)
 
 # GHC can compile either a single file (use GHCCOMPILEFLAGS) or

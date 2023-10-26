@@ -4,11 +4,11 @@ module Main_bsc_lsp(main, hmain) where
 -- Haskell libs
 import Prelude
 import System.Environment(getArgs, getProgName)
-import System.Process(runInteractiveProcess, waitForProcess)
+import System.Process(runInteractiveProcess, waitForProcess, readProcessWithExitCode)
 import System.Process(system)
 import System.Exit(ExitCode(ExitFailure, ExitSuccess))
 import System.FilePath(takeDirectory)
-import System.IO(hFlush, stdout, hPutStr, stderr, hGetContents, hClose, hSetBuffering, BufferMode(LineBuffering))
+import System.IO(openFile, IOMode(AppendMode, WriteMode), hFlush, stdout, hPutStr, hPutStrLn, stderr, hGetContents, hClose, hSetBuffering, BufferMode(LineBuffering))
 import System.IO(hSetEncoding, utf8)
 import System.Posix.Files(fileMode,  unionFileModes, ownerExecuteMode, groupExecuteMode, setFileMode, getFileStatus, fileAccess)
 import System.Directory(getDirectoryContents, doesFileExist, getCurrentDirectory)
@@ -171,46 +171,69 @@ import Language.LSP.Protocol.Types qualified as LSP
 import Language.LSP.Protocol.Lens qualified as LSP
 import Control.Monad.IO.Class
 import Data.Text qualified as T
+import Data.Text.Lazy (toStrict) 
+import Data.Text.Format
 import Language.LSP.VFS qualified as VFS
 import Control.Lens ((^.), to) -- Convenient
 import Data.Maybe (fromMaybe)
+import Data.Aeson qualified as J
+import Data.Aeson hiding (Null, defaultOptions)
 
-
+import Control.Monad.Reader
+-- import Data.Text.Prettyprint.Doc (comma)
+-- Useful snippet:
+ 
 -- bsc_tc should update tc the content, it should also store the results, indexed by URI + version 
 -- What to do for the dependencies that are recompiled on-the-fly? Do we have an URI for them?
 bsc_tc = undefined
+debug :: (MonadIO m) => String -> m ()
+debug msg = liftIO $ hPutStrLn stderr $ "[bsc_lsp] " <> msg
 -- args <- getArgs
 -- bsCatch (hmain args)
 handlers :: Handlers (LspM ())
 handlers =
   mconcat
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
-        -- Maybe we should compile everything here?
+       sendNotification 
+            LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log "BSC LSP Server Initialized"
+    , notificationHandler LSP.SMethod_WorkspaceDidChangeConfiguration $ \_not -> do
+        -- For now, no config, in the future, probably the Library path and stuff
         return ()
     , notificationHandler LSP.SMethod_TextDocumentDidOpen $ \msg -> do
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             content = msg ^. LSP.params . LSP.textDocument . LSP.text  -- Extract content first time file is opened
-        -- Call "bsc -u filename", do we actually have the filename here, from doc?
-        -- We might need some yaml configuration file to know the paths toward the dependencies (if they are not local)
-        -- Then call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
-        -- per URI we should record the latest usable CPackage
-        bsc_tc (LSP.toNormalizedUri doc) Nothing content
+            file = fromMaybe (error "Invalid URI") $ LSP.uriToFilePath doc
+            commandArgs = ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", "-u", file ]
+            stdin' = ""
+        -- handle <- liftIO $ openFile "/tmp/output.txt" AppendMode
+        (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode "/home/tbourgea/git/bsc-lsp/inst/bin/bsc" commandArgs stdin' 
+        ok <- liftIO $ hmain ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", file] (T.unpack content)
+        let txt = toStrict $ format "Compilation of {} and its dependencies: {} and {}" (file, show errCode, ok)
+        sendNotification LSP.SMethod_WindowLogMessage $
+            LSP.LogMessageParams LSP.MessageType_Log $ txt
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
-        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri . to LSP.toNormalizedUri
-        mdoc <- getVirtualFile doc
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri 
+            file = fromMaybe (error "Invalid URI") $ LSP.uriToFilePath doc
+            commandArgs = ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", file ]
+        mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
         case mdoc of
           Just vf@(VFS.VirtualFile _ version _rope) -> do
-            -- Then call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
-            -- per URI we should record the latest usable CPackage
-            bsc_tc doc (Just $ fromIntegral version) (VFS.virtualFileText vf)
+            ok <- liftIO $ hmain commandArgs (T.unpack (VFS.virtualFileText vf))
+            let txt = toStrict $ format "Compilation of {}:  {}" (file, ok)
+            sendNotification LSP.SMethod_WindowLogMessage $
+                LSP.LogMessageParams LSP.MessageType_Log $ txt
           _ -> undefined -- error
     , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             content = fromMaybe "?" $ msg ^. LSP.params . LSP.text
+        return ()
+
+        -- sendNotification  LSP.SMethod_WindowLogMessage $
+        --     LSP.LogMessageParams LSP.MessageType_Log "Saved"
             -- call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
             -- then call bsc -u filename
             -- per URI we should record the latest usable CPackage
-        bsc_tc (LSP.toNormalizedUri doc) Nothing content
+        -- bsc_tc (LSP.toNormalizedUri doc) Nothing content
     , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
         let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
             uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
@@ -222,6 +245,29 @@ handlers =
         -- (Note: Could be several definitions?)
         defs <- undefined
         responder $ undefined
+    , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
+        -- let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
+            -- uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
+        -- Make a state monad that contains the compiled modules so far, query this big table 
+        -- Query all the compiled modules that are in scope and nonqualified, and ask for global symbols
+        -- Also query the VFS to get the current file, to know what identifier is at the position pos.
+        -- for that we will probably need to index what BSC produced, to build a table for the current file.
+        -- We will want ot build the indexed table (Identifier <-> [positions])
+        -- (Note: Could be several definitions?)
+        responder $
+            Right $
+              LSP.InR $
+                LSP.InL
+                  [ LSP.DocumentSymbol
+                      "foo"
+                      Nothing
+                      LSP.SymbolKind_Object
+                      Nothing
+                      Nothing
+                      (LSP.mkRange 0 0 3 6)
+                      (LSP.mkRange 0 0 3 6)
+                      Nothing
+                  ]
     ]
      
 
@@ -231,12 +277,20 @@ main = do
     hSetBuffering stderr LineBuffering
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
+    handle <- liftIO $ openFile "/tmp/output.txt" WriteMode
+    liftIO $ hPutStr handle "Starting LSP\n"
+    liftIO $ hClose handle
     runServer $
-        ServerDefinition { parseConfig = const $ const $ Right ()
+        ServerDefinition { parseConfig = \_old new -> case fromJSON new of
+            J.Success v -> Right v
+            J.Error err -> Left $ T.pack err
+            --  const $ const $ Right ()
                          , onConfigChange = const $ pure ()
                          , defaultConfig = ()
                          , configSection = "demo"
-                         , doInitialize = \env _req -> pure $ Right env
+                         , doInitialize = \env _req -> 
+                            -- liftIO $ putStrLn "Initialize?"
+                            pure $ Right env
                          , staticHandlers = \_caps -> handlers
                          , interpretHandler = \env -> Iso (runLspT env) liftIO
                          , options = defaultOptions { -- set sync options to get DidSave event, as well as Open and Close events.
@@ -254,7 +308,6 @@ main = do
 
 
 -- Use with hugs top level
-hmain :: [String] -> String -> IO ()
 hmain args contentFile = do
     pprog <- getProgName
     cdir <- getEnvDef "BLUESPECDIR" dfltBluespecDir
@@ -275,27 +328,14 @@ hmain args contentFile = do
     let doWarnings = when ((not . null) warnings) $ bsWarning errh warnings
         setFlags = setErrorHandleFlags errh
     case decoded of
-        DHelp flags ->
-            do { setFlags flags; doWarnings;
-                 exitWithHelp errh pprog args' cdir }
-        DHelpHidden flags ->
-            do { setFlags flags; doWarnings;
-                 exitWithHelpHidden errh pprog args' cdir }
-        DUsage -> exitWithUsage errh pprog
-        DError msgs -> bsError errh msgs
-        DNoSrc flags ->
-            -- XXX we want to allow "bsc -v" and similar calls
-            -- XXX to print version, etc, but if there are other flags
-            -- XXX on the command-line we probably should report an error
-            do { setFlags flags; doWarnings; showPreamble flags;
-                 exitOK errh }
         DBlueSrc flags src ->
             do { setFlags flags; doWarnings; showPreamble flags;
-                 main' errh flags src contentFile;
-                 exitOK errh }
+                 main' errh flags src contentFile
+                }
+        _ -> error "Internal error bsc_lsp"
        
 
-main' :: ErrorHandle -> Flags -> String -> String -> IO ()
+main' :: ErrorHandle -> Flags -> String -> String -> IO Bool
 main' errh flags name contentFile =  do
     setErrorHandleFlags errh flags
     tStart <- getNow
@@ -304,14 +344,9 @@ main' errh flags name contentFile =  do
     -- check system requirements
     -- doSystemCheck errh
     let comp = compile_no_deps
-    success <- comp errh flags' name contentFile
+    comp errh flags' name contentFile
 
-    -- final verbose message
-    if success then
-      return ()
-     else
-       exitFail errh
-
+   
 compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO (Bool)
 compile_no_deps errh flags name contentFile = do
   (ok, _, _) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
@@ -321,6 +356,10 @@ compile_no_deps errh flags name contentFile = do
 compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String -> String ->
                IO (Bool, BinMap HeapData, HashMap)
 compileFile errh flags binmap hashmap name_orig file = do
+
+    handle <- openFile "/tmp/output.txt" AppendMode 
+    hPutStr handle "Start Compiling\n"
+    hClose handle
     pwd <- getCurrentDirectory
     let name = (createEncodedFullFilePath name_orig pwd)
 
@@ -331,9 +370,15 @@ compileFile errh flags binmap hashmap name_orig file = do
 
     t <- getNow
     -- ===== the break point between file manipulation and compilation
-
+    -- handle <- openFile "/tmp/outputLSP.txt" WriteMode 
+    -- hPutStr handle name_orig
+    -- hPutStr handle file
+    -- hClose handle
     (pkg@(CPackage i _ _ _ _ _), t)
         <- parseSrc False errh flags True name file    
+    handle <- openFile "/tmp/output.txt" AppendMode 
+    hPutStr handle "Finished Parsing\n"
+    hClose handle
     -- [T]: In the case where there is a parsing error, what to do?
 
     let dumpnames = (baseName (dropSuf name), getIdString (unQualId i), "")
@@ -362,6 +407,9 @@ compilePackage
     name -- String --
     min@(CPackage pkgId _ _ _ _ _) = do
 
+    handle <- openFile "/tmp/output.txt" AppendMode 
+    liftIO $ hPutStr handle "Start Package\n"
+    liftIO $ hClose handle
     clkTime <- getClockTime
     epochTime <- getPOSIXTime
 

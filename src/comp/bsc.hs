@@ -8,7 +8,7 @@ import System.Process(runInteractiveProcess, waitForProcess)
 import System.Process(system)
 import System.Exit(ExitCode(ExitFailure, ExitSuccess))
 import System.FilePath(takeDirectory)
-import System.IO(hFlush, stdout, hPutStr, stderr, hGetContents, hClose, hSetBuffering, BufferMode(LineBuffering))
+import System.IO(hFlush, IOMode(AppendMode, WriteMode), openFile, stdout, hPutStr, stderr, hGetContents, hClose, hSetBuffering, BufferMode(LineBuffering))
 import System.IO(hSetEncoding, utf8)
 import System.Posix.Files(fileMode,  unionFileModes, ownerExecuteMode, groupExecuteMode, setFileMode, getFileStatus, fileAccess)
 import System.Directory(getDirectoryContents, doesFileExist, getCurrentDirectory)
@@ -315,7 +315,10 @@ compileFile errh flags binmap hashmap name_orig = do
     _ <- dumpStr errh flags t DFcpp dumpnames file
 
     -- ===== the break point between file manipulation and compilation
-
+    handle <- openFile "/tmp/outputOG.txt" WriteMode 
+    hPutStr handle name_orig
+    hPutStr handle file
+    hClose handle
     -- We don't start and dump this stage because that is handled inside
     -- the "parseSrc" function (since BSV parsing has multiple stages)
     (pkg@(CPackage i _ _ _ _ _), t)
