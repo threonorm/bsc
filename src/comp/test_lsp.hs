@@ -21,9 +21,14 @@ main = runSessionWithConfig defaultConfig{ignoreLogNotifications=False, logMessa
   liftIO $ print doc
   rsp <-anyNotification
   liftIO $ print rsp
-  -- rsp <-anyNotification 
+
+  rsp <-anyNotification
+  liftIO $ print rsp
   -- liftIO $ print rsp
   sendNotification SMethod_TextDocumentDidChange (DidChangeTextDocumentParams (VersionedTextDocumentIdentifier (doc ^. uri ) 1)[])
+  rsp <- anyNotification
+  liftIO $ print rsp
+
   rsp <- anyNotification
   liftIO $ print rsp
   -- rsp <-anyNotification 

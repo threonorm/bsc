@@ -1,4 +1,5 @@
-{-# LANGUAGE BangPatterns, CPP, OverloadedStrings, DuplicateRecordFields, LambdaCase #-}
+{-# LANGUAGE BangPatterns, CPP, OverloadedStrings, DuplicateRecordFields, LambdaCase#-}
+{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 module Main_bsc_lsp(main, hmain) where
 
 -- Haskell libs
@@ -10,6 +11,7 @@ import System.Exit(ExitCode(ExitFailure, ExitSuccess))
 import System.FilePath(takeDirectory)
 import System.IO(openFile, IOMode(AppendMode, WriteMode), hFlush, stdout, hPutStr, hPutStrLn, stderr, hGetContents, hClose, hSetBuffering, BufferMode(LineBuffering))
 import System.IO(hSetEncoding, utf8)
+import System.IO.Error(ioeGetErrorType)
 import System.Posix.Files(fileMode,  unionFileModes, ownerExecuteMode, groupExecuteMode, setFileMode, getFileStatus, fileAccess)
 import System.Directory(getDirectoryContents, doesFileExist, getCurrentDirectory)
 import System.Time(getClockTime, ClockTime(TOD)) -- XXX: from old-time package
@@ -68,11 +70,11 @@ import FlagsDecode(
         exitWithUsage,
         exitWithHelp,
         exitWithHelpHidden)
-import Error(internalError, ErrMsg(..),
-             ErrorHandle, initErrorHandle, setErrorHandleFlags,
-             bsError, bsWarning, bsMessage,
+import Error(ErrorHandle(..), ErrorState(..), internalError, ErrMsg(..), ExcepWarnErr(..),
+             initErrorHandle, setErrorHandleFlags,
+             bsError, extractPosition, extractMessage, bsWarning, bsMessage,
              exitFail, exitOK, exitFailWith)
-import Position(noPosition, cmdPosition)
+import Position(noPosition, cmdPosition, Position (pos_line, pos_column))
 import CVPrint
 import Id
 import Backend
@@ -171,21 +173,26 @@ import Language.LSP.Protocol.Types qualified as LSP
 import Language.LSP.Protocol.Lens qualified as LSP
 import Control.Monad.IO.Class
 import Data.Text qualified as T
-import Data.Text.Lazy (toStrict) 
+import Data.Text.Lazy (toStrict)
 import Data.Text.Format
 import Language.LSP.VFS qualified as VFS
 import Control.Lens ((^.), to) -- Convenient
 import Data.Maybe (fromMaybe)
 import Data.Aeson qualified as J
-import Data.Aeson hiding (Null, defaultOptions)
+import Data.Aeson ( fromJSON )
+import GHC.IO(catchException)
 
 import Control.Monad.Reader
+import Language.LSP.Protocol.Types (DiagnosticSeverity(DiagnosticSeverity_Error))
+-- import Data.Text.Utf16.Rope
 -- import Data.Text.Prettyprint.Doc (comma)
 -- Useful snippet:
- 
+
 -- bsc_tc should update tc the content, it should also store the results, indexed by URI + version 
 -- What to do for the dependencies that are recompiled on-the-fly? Do we have an URI for them?
-bsc_tc = undefined
+bsc_exe :: FilePath
+bsc_exe = "/home/tbourgea/git/bsc-lsp/inst/bin/bsc"
+
 debug :: (MonadIO m) => String -> m ()
 debug msg = liftIO $ hPutStrLn stderr $ "[bsc_lsp] " <> msg
 -- args <- getArgs
@@ -193,10 +200,19 @@ debug msg = liftIO $ hPutStrLn stderr $ "[bsc_lsp] " <> msg
 handlers :: Handlers (LspM ())
 handlers =
   mconcat
+--   Add handler for completion
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
-       sendNotification 
+
+    --    handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+    --    liftIO $ hPutStr handle $ "Init"
+    --    liftIO $ hClose handle
+       sendNotification
             LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log "BSC LSP Server Initialized"
     , notificationHandler LSP.SMethod_WorkspaceDidChangeConfiguration $ \_not -> do
+        -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+        -- liftIO $ hPutStr handle $ "DidChangeConfig"
+        -- liftIO $ hClose handle
+
         -- For now, no config, in the future, probably the Library path and stuff
         return ()
     , notificationHandler LSP.SMethod_TextDocumentDidOpen $ \msg -> do
@@ -205,71 +221,197 @@ handlers =
             file = fromMaybe (error "Invalid URI") $ LSP.uriToFilePath doc
             commandArgs = ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", "-u", file ]
             stdin' = ""
-        -- handle <- liftIO $ openFile "/tmp/output.txt" AppendMode
-        (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode "/home/tbourgea/git/bsc-lsp/inst/bin/bsc" commandArgs stdin' 
-        ok <- liftIO $ hmain ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", file] (T.unpack content)
-        let txt = toStrict $ format "Compilation of {} and its dependencies: {} and {}" (file, show errCode, ok)
-        sendNotification LSP.SMethod_WindowLogMessage $
-            LSP.LogMessageParams LSP.MessageType_Log $ txt
+            handleErr (ExcepWarnErr a b c ) = (do
+                return $ Just (a,b))
+
+        sendNotification
+             LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log "Open File"
+        (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode bsc_exe commandArgs stdin'
+
+        -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+        -- liftIO $ hPutStr handle $ "Compiled Did Open and got " ++ show errCode  
+        -- liftIO $ hClose handle
+        maybe_err <- liftIO $ catchException
+                        ((\x -> if x then Nothing else Just ([], [])) <$> hmain ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", file] (T.unpack content))
+                        handleErr
+
+        -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+        -- liftIO $ hPutStr handle $ "Parsed " 
+        -- liftIO $ hClose handle
+        case maybe_err of
+            Just (err , warn) -> do
+                let diag =  map (\x -> let pos = extractPosition x  in
+                                    LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0
+                                                                (fromIntegral $ pos_line pos - 1) 1000) 
+                                                (Just DiagnosticSeverity_Error) 
+                                                Nothing Nothing Nothing 
+                                                (T.pack (show $ extractMessage x))
+                                                Nothing Nothing Nothing ) err
+                let diagw =  map (\x -> let pos = extractPosition x  in
+                                    LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0
+                                                                (fromIntegral $ pos_line pos - 1) 1000) 
+                                                (Just LSP.DiagnosticSeverity_Warning) 
+                                                Nothing Nothing Nothing 
+                                                (T.pack $ show $ extractMessage x)
+                                                Nothing Nothing Nothing) warn
+                -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+                -- liftIO $ hPutStr handle $ show (diag ++ diagw)
+                -- liftIO $ hClose handle
+                    -- sendNotification LSP.SMethod_WindowLogMessage $
+                    --     LSP.LogMessageParams LSP.MessageType_Log $ toStrict $ 
+                    --         format 
+                    --             "Error {} Warning {} Ctxt {} "
+                sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $
+                      LSP.PublishDiagnosticsParams doc Nothing (diag ++ diagw)
+            Nothing -> do
+                -- let txt = toStrict $ format "Compilation of {} and its dependencies: {}" (file, show errCode)
+                -- sendNotification LSP.SMethod_WindowLogMessage $
+                --     LSP.LogMessageParams LSP.MessageType_Log $ txt
+                sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $
+                      LSP.PublishDiagnosticsParams doc Nothing []
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
-        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri 
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             file = fromMaybe (error "Invalid URI") $ LSP.uriToFilePath doc
             commandArgs = ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", file ]
+            handleErr (ExcepWarnErr a b c ) = (do
+                return $ Just (a,b))
+
+        -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+        -- liftIO $ hPutStr handle $ "DidChange"
+        -- liftIO $ hClose handle
+        -- sendNotification
+            --  LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log "Did Change"
+        mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
+        case mdoc of
+          Just vf@(VFS.VirtualFile _ version rope) -> do
+            -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+            -- liftIO $ hPutStr handle $ T.unpack (VFS.virtualFileText vf)
+            -- liftIO $ hPutStr handle $ "END NEW CHANGE\n" 
+            -- liftIO $ hClose handle
+            ok <- liftIO $ catchException ((\x -> if x then Nothing else Just ([], [])) <$> hmain commandArgs (T.unpack (VFS.virtualFileText vf)))
+                    handleErr
+            case ok of
+                Just (err,warn) ->  do
+                    let diag =  map (\x -> let pos = extractPosition x  
+                                               diag = LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0 
+                                                                    (fromIntegral $ pos_line pos-1) 1000) 
+                                                    (Just DiagnosticSeverity_Error) 
+                                                    Nothing Nothing Nothing 
+                                                    (T.pack (show $ extractMessage x))
+                                                    Nothing Nothing Nothing in
+                                            diag) err
+                    let diagw =  map (\x -> let pos = extractPosition x  in
+                                                LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0 
+                                                                    (fromIntegral $ pos_line pos - 1) 1000) 
+                                                    (Just LSP.DiagnosticSeverity_Warning) 
+                                                    Nothing Nothing Nothing 
+                                                    (T.pack $ show $ extractMessage x)
+                                                    Nothing Nothing Nothing) warn
+                    -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+                    -- liftIO $ hPutStr handle $ show (diag ++ diagw)
+                    -- liftIO $ hClose handle
+                    sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $
+                          LSP.PublishDiagnosticsParams doc Nothing (diag ++ diagw)
+                    -- sendNotification LSP.SMethod_WindowLogMessage $
+                    --     LSP.LogMessageParams LSP.MessageType_Log $ toStrict $ 
+                    --         format 
+                    --             "Error {} Warning {} Ctxt {} "
+                    --             (show (map extractPosition err), show (map extractPosition warn), show ctx)
+                Nothing -> do
+                    -- let txt = toStrict $ format "Compilation of {}:  {}" (file, True)
+                    -- sendNotification LSP.SMethod_WindowLogMessage $
+                    --     LSP.LogMessageParams LSP.MessageType_Log txt
+                    sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $
+                          LSP.PublishDiagnosticsParams doc Nothing []
+          _ -> return () -- error
+    , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+            file = fromMaybe (error "Invalid URI") $ LSP.uriToFilePath doc
+            commandArgs = ["--aggressive-conditions", "-p", "testsuite/lsp:+", "-bdir", "/tmp/build_bsc", file ]
+            handleErr (ExcepWarnErr a b c ) = (do
+                return $ Just (a,b))
         mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
         case mdoc of
           Just vf@(VFS.VirtualFile _ version _rope) -> do
-            ok <- liftIO $ hmain commandArgs (T.unpack (VFS.virtualFileText vf))
-            let txt = toStrict $ format "Compilation of {}:  {}" (file, ok)
-            sendNotification LSP.SMethod_WindowLogMessage $
-                LSP.LogMessageParams LSP.MessageType_Log $ txt
-          _ -> undefined -- error
-    , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
-        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
-            content = fromMaybe "?" $ msg ^. LSP.params . LSP.text
+            let stdin' = ""
+            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode bsc_exe commandArgs stdin'
+            ok <- liftIO $ catchException ((\x -> if x then Nothing else Just ([], [])) <$> hmain commandArgs (T.unpack (VFS.virtualFileText vf)))
+                    handleErr
+            case ok of
+                Just (err,warn) ->  do
+                    let diag =  map (\x -> let pos = extractPosition x  
+                                               diag = LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0 
+                                                                    (fromIntegral $ pos_line pos - 1) 1000) 
+                                                    (Just DiagnosticSeverity_Error) 
+                                                    Nothing Nothing Nothing 
+                                                    (T.pack (show $ extractMessage x))
+                                                    Nothing Nothing Nothing in
+                                            diag) err
+                    let diagw =  map (\x -> let pos = extractPosition x  in
+                                                LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0 
+                                                                    (fromIntegral $ pos_line pos - 1) 1000) 
+                                                    (Just LSP.DiagnosticSeverity_Warning) 
+                                                    Nothing Nothing Nothing 
+                                                    (T.pack $ show $ extractMessage x)
+                                                    Nothing Nothing Nothing) warn
+                    -- handle <- liftIO $ openFile "/tmp/reached.txt" AppendMode
+                    -- liftIO $ hPutStr handle $ show (diag ++ diagw)
+                    -- liftIO $ hClose handle
+                    sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $
+                          LSP.PublishDiagnosticsParams doc Nothing (diag ++ diagw)
+                    -- sendNotification LSP.SMethod_WindowLogMessage $
+                    --     LSP.LogMessageParams LSP.MessageType_Log $ toStrict $ 
+                    --         format 
+                    --             "Error {} Warning {} Ctxt {} "
+                    --             (show (map extractPosition err), show (map extractPosition warn), show ctx)
+                Nothing -> do
+                    -- let txt = toStrict $ format "Compilation of {}:  {}" (file, True)
+                    -- sendNotification LSP.SMethod_WindowLogMessage $
+                    --     LSP.LogMessageParams LSP.MessageType_Log txt
+                    sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $
+                          LSP.PublishDiagnosticsParams doc Nothing []
+
+          _ -> return ()
+    -- , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
+    --     let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
+    --         uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
+    --     -- Make a state monad that contains the compiled modules so far, query this big table 
+    --     -- Query all the compiled modules that are in scope and nonqualified, and ask for global symbols
+    --     -- Also query the VFS to get the current file, to know what identifier is at the position pos.
+    --     -- for that we will probably need to index what BSC produced, to build a table for the current file.
+    --     -- We will want ot build the indexed table (Identifier <-> [positions])
+    --     -- (Note: Could be several definitions?)
+    --     defs <- undefined
+    --     responder $ undefined
+    -- , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
+    --     -- let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
+    --         -- uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
+    --     -- Make a state monad that contains the compiled modules so far, query this big table 
+    --     -- Query all the compiled modules that are in scope and nonqualified, and ask for global symbols
+    --     -- Also query the VFS to get the current file, to know what identifier is at the position pos.
+    --     -- for that we will probably need to index what BSC produced, to build a table for the current file.
+    --     -- We will want ot build the indexed table (Identifier <-> [positions])
+    --     -- (Note: Could be several definitions?)
+    --     responder $
+    --         Right $
+    --           LSP.InR $
+    --             LSP.InL
+    --               [ LSP.DocumentSymbol
+    --                   "foo"
+    --                   Nothing
+    --                   LSP.SymbolKind_Object
+    --                   Nothing
+    --                   Nothing
+    --                   (LSP.mkRange 0 0 3 6)
+    --                   (LSP.mkRange 0 0 3 6)
+    --                   Nothing
+    --               ]
+
+    , notificationHandler LSP.SMethod_SetTrace $ \msg -> do -- Check what is being written
         return ()
 
-        -- sendNotification  LSP.SMethod_WindowLogMessage $
-        --     LSP.LogMessageParams LSP.MessageType_Log "Saved"
-            -- call main : hmain ["--aggressive-conditions", (LSP.toNormalizedUri doc)] content
-            -- then call bsc -u filename
-            -- per URI we should record the latest usable CPackage
-        -- bsc_tc (LSP.toNormalizedUri doc) Nothing content
-    , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
-        let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
-            uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
-        -- Make a state monad that contains the compiled modules so far, query this big table 
-        -- Query all the compiled modules that are in scope and nonqualified, and ask for global symbols
-        -- Also query the VFS to get the current file, to know what identifier is at the position pos.
-        -- for that we will probably need to index what BSC produced, to build a table for the current file.
-        -- We will want ot build the indexed table (Identifier <-> [positions])
-        -- (Note: Could be several definitions?)
-        defs <- undefined
-        responder $ undefined
-    , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
-        -- let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
-            -- uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
-        -- Make a state monad that contains the compiled modules so far, query this big table 
-        -- Query all the compiled modules that are in scope and nonqualified, and ask for global symbols
-        -- Also query the VFS to get the current file, to know what identifier is at the position pos.
-        -- for that we will probably need to index what BSC produced, to build a table for the current file.
-        -- We will want ot build the indexed table (Identifier <-> [positions])
-        -- (Note: Could be several definitions?)
-        responder $
-            Right $
-              LSP.InR $
-                LSP.InL
-                  [ LSP.DocumentSymbol
-                      "foo"
-                      Nothing
-                      LSP.SymbolKind_Object
-                      Nothing
-                      Nothing
-                      (LSP.mkRange 0 0 3 6)
-                      (LSP.mkRange 0 0 3 6)
-                      Nothing
-                  ]
     ]
-     
+
 
 main :: IO Int
 main = do
@@ -288,7 +430,7 @@ main = do
                          , onConfigChange = const $ pure ()
                          , defaultConfig = ()
                          , configSection = "demo"
-                         , doInitialize = \env _req -> 
+                         , doInitialize = \env _req ->
                             -- liftIO $ putStrLn "Initialize?"
                             pure $ Right env
                          , staticHandlers = \_caps -> handlers
@@ -324,7 +466,7 @@ hmain args contentFile = do
                 putStrLnF (showFlags flags)
           when (printFlagsRaw flags) $ putStrLnF (showFlagsRaw flags)
     let (warnings, decoded) = decodeArgs (baseName pprog) args' cdir
-    errh <- initErrorHandle
+    errh <- initErrorHandle True
     let doWarnings = when ((not . null) warnings) $ bsWarning errh warnings
         setFlags = setErrorHandleFlags errh
     case decoded of
@@ -333,7 +475,7 @@ hmain args contentFile = do
                  main' errh flags src contentFile
                 }
         _ -> error "Internal error bsc_lsp"
-       
+
 
 main' :: ErrorHandle -> Flags -> String -> String -> IO Bool
 main' errh flags name contentFile =  do
@@ -346,7 +488,7 @@ main' errh flags name contentFile =  do
     let comp = compile_no_deps
     comp errh flags' name contentFile
 
-   
+
 compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO (Bool)
 compile_no_deps errh flags name contentFile = do
   (ok, _, _) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
@@ -357,7 +499,7 @@ compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String -> S
                IO (Bool, BinMap HeapData, HashMap)
 compileFile errh flags binmap hashmap name_orig file = do
 
-    handle <- openFile "/tmp/output.txt" AppendMode 
+    handle <- openFile "/tmp/output.txt" AppendMode
     hPutStr handle "Start Compiling\n"
     hClose handle
     pwd <- getCurrentDirectory
@@ -375,10 +517,7 @@ compileFile errh flags binmap hashmap name_orig file = do
     -- hPutStr handle file
     -- hClose handle
     (pkg@(CPackage i _ _ _ _ _), t)
-        <- parseSrc False errh flags True name file    
-    handle <- openFile "/tmp/output.txt" AppendMode 
-    hPutStr handle "Finished Parsing\n"
-    hClose handle
+        <- parseSrc False errh flags True name file
     -- [T]: In the case where there is a parsing error, what to do?
 
     let dumpnames = (baseName (dropSuf name), getIdString (unQualId i), "")
@@ -407,7 +546,7 @@ compilePackage
     name -- String --
     min@(CPackage pkgId _ _ _ _ _) = do
 
-    handle <- openFile "/tmp/output.txt" AppendMode 
+    handle <- openFile "/tmp/output.txt" AppendMode
     liftIO $ hPutStr handle "Start Package\n"
     liftIO $ hClose handle
     clkTime <- getClockTime

@@ -11,7 +11,6 @@ module mkMyInterface(MyInterface);
     endmethod
 endmodule
 
-
 module mkBigInterface(BigFoo);
     let x <- mkMyInterface;
 
