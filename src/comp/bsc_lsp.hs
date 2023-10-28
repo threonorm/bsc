@@ -234,8 +234,9 @@ handlers =
 
     -- -- TODO: Investigate if the notion of documentation is understood internally by the BSC compiler
     -- , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
-
-    -- -- TODO: At some point, the following seemed to be necessary? 
+    
+    -- -- TODO: I don't know what SetTrace is used for, but vscode keeps sending
+    -- those event, so we make a dummy handler.
     , notificationHandler LSP.SMethod_SetTrace $ \msg -> do
         return ()
     ]
