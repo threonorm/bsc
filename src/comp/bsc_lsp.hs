@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, OverloadedStrings, DuplicateRecordFields #-}
+{-# LANGUAGE CPP, OverloadedStrings, DuplicateRecordFields, DeriveAnyClass, DeriveGeneric #-}
 {-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use camelCase" #-}
@@ -51,8 +51,9 @@ import FlagsDecode(
         showFlags,
         showFlagsRaw)
 import Error(ErrorHandle, ExcepWarnErr(..),
+             prEMsg, swarning, serror,
              initErrorHandle, setErrorHandleFlags,
-             extractPosition, extractMessage, bsWarning)
+             extractPosition,  bsWarning)
 import Position(Position (..))
 import CVPrint
 import Id
@@ -83,38 +84,42 @@ import Data.Aeson qualified as J
 import GHC.IO(catchException)
 
 import Data.List qualified as L
-import qualified Control.Monad as Monad
+import Control.Monad qualified as Monad
+import PPrint qualified as P
+import GHC.Generics (Generic)
 
--- TODO: For the few user-provided variables, maybe the easiest is to simply
+-- TODO: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
--- (instead of passing them as command lines or passing it as parameters to the
--- LSP server using RPC).
 
+data Config = Config {bscExe :: FilePath, buildDir:: FilePath}
+  deriving (Generic, J.ToJSON, J.FromJSON, Show)
 
 -- TODO bsv_exe should be provided by the LSP client
-bsc_exe :: FilePath
-bsc_exe = "/home/tbourgea/git/bsc-lsp/inst/bin/bsc"
+bscExeDefault :: FilePath
+bscExeDefault = "bsc"
 
 -- TODO bsvUserDir should be provided by the LSP client in the future
-bsvUserDir :: [ String ]
+bsvUserDir :: [String]
 bsvUserDir = []
--- bsvUserDir = ["testsuite/lsp"]
 
-pathBsvLibs :: String
-pathBsvLibs = Monad.join . L.intersperse ":" $ bsvUserDir ++ ["+"]
+pathBsvLibs :: Config -> String
+pathBsvLibs cfg = Monad.join . L.intersperse ":" $ bsvUserDir ++ ["+"]
+
+bscExtraArgs :: [String]
+bscExtraArgs = []
 
 -- TODO create the directory if it does not exist otherwise it crashes the LSP server
 -- In the future, the build folder should be chosen by the LSP client.
 -- As it uses standard BO file, it *might* make sense to reuse the project build
 -- folder, more thought are needed.
-buildDir :: String
-buildDir = "/tmp/build_bsc/"
+buildDirDefault :: FilePath 
+buildDirDefault = "/tmp/build_bsc/"
 
 
 -- Every options passed to Bluespec except the filename, and [-u] in the case
 -- where we compile recursively
-commandOptions :: [String]
-commandOptions = ["--aggressive-conditions", "-p", pathBsvLibs, "-bdir", buildDir]
+commandOptions :: Config -> [String]
+commandOptions cfg = ["--aggressive-conditions"] ++ bscExtraArgs ++ ["-p", pathBsvLibs cfg, "-bdir", buildDir cfg]
 
 logForClient :: MonadLsp config f => T.Text -> f ()
 logForClient x = sendNotification LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log x
@@ -123,27 +128,29 @@ logForClient x = sendNotification LSP.SMethod_WindowLogMessage $ LSP.LogMessageP
 errorForClient :: MonadLsp config f => T.Text -> f ()
 errorForClient x = sendNotification LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Error x
 
--- TODO: Improve the diagnostic display using bsc printing function for errors
 diagsForClient :: MonadLsp config f => LSP.Uri -> [LSP.Diagnostic] -> f ()
 diagsForClient doc diags = sendNotification LSP.SMethod_TextDocumentPublishDiagnostics $ LSP.PublishDiagnosticsParams doc Nothing diags
 
 -- We modified the error handling of the compiler to generate an exception [ExcepWarnErr] on warnings and errors
 -- This function transform such an exception into LSP diagnostics
 diagFromExcep  :: ExcepWarnErr -> ([LSP.Diagnostic], [LSP.Diagnostic])
-diagFromExcep(ExcepWarnErr err warn ctxt) = do
+diagFromExcep (ExcepWarnErr err warn ctxt) = do
     let diag =  map (\x -> let pos = extractPosition x  in
                         LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0
                                                     (fromIntegral $ pos_line pos - 1) 1000)
                                     (Just LSP.DiagnosticSeverity_Error)
                                     Nothing Nothing Nothing
-                                    (T.pack (show $ extractMessage x))
+                                    (T.pack . P.pretty 78 78 . prEMsg serror ctxt $ x)
+                                    -- TODO remove following lines
+                                    -- (T.pack (show $ extractMessage x))
                                     Nothing Nothing Nothing ) err
         diagw =  map (\x -> let pos = extractPosition x  in
                         LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0
                                                     (fromIntegral $ pos_line pos - 1) 1000)
                                     (Just LSP.DiagnosticSeverity_Warning)
                                     Nothing Nothing Nothing
-                                    (T.pack $ show $ extractMessage x)
+                                    (T.pack . P.pretty 78 78 . prEMsg swarning ctxt $ x)
+                                    -- (T.pack $ show $ extractMessage x)
                                     Nothing Nothing Nothing) warn
     (diag, diagw)
 
@@ -156,42 +163,46 @@ withFilePathFromUri uri k =
         Just s -> k s
         Nothing -> logForClient . toStrict $ format "URI {} cannot be transformed into Filepath" (Only (show uri))
 
-handlers :: Handlers (LspM ())
+handlers :: Handlers (LspM Config)
 handlers =
   mconcat
 --   Add handler for completion
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
-        logForClient "BSC LSP Server Initialized"
+        cfg <- getConfig 
+        logForClient . toStrict $ format "BSC LSP Server Initialized {} " (Only (show cfg))
     , notificationHandler LSP.SMethod_WorkspaceDidChangeConfiguration $ \_dummy -> do
-        -- TODO In the future handle potential dynamic server configuration change here
+        -- See Note about LSP configuration in the haskell lsp package
         return ()
     , notificationHandler LSP.SMethod_TextDocumentDidOpen $ \msg -> do
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             content = msg ^. LSP.params . LSP.textDocument . LSP.text  -- Extract content first time file is opened
+        cfg <- getConfig
         withFilePathFromUri doc (\file -> do
-            logForClient . toStrict $ format  "Open File {} " (Only file)
+            -- logForClient . toStrict $ format  "Open File {} " (Only file)
 
             -- First we call the fullblown compiler recursively, to get the [.bo]
             -- files of the submodules and then
-            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode bsc_exe (commandOptions ++ [ "-u", file ]) ""
+            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg ++ [ "-u", file ]) ""
 
             -- Independently of the success of the previous step (technically we
             -- could skip it if the previous step was successful) we call the
-            -- frontend of the compiler that we carved out in the current file (it
-            -- compiles up to typechecking), in case where an error is found
-            -- (parsing, importing submodules, typechecking, etc...), an exception
-            -- is raised by the compiler.  We catch this exception here with, and we
+            -- frontend of the compiler in the current file (it compiles up to
+            -- typechecking), in case where an error is found (parsing,
+            -- importing submodules, typechecking, etc...), an exception is
+            -- raised by the compiler.  We catch this exception here  and we
             -- display it as diagnostic
-            (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions ++ [file])  (T.unpack content)) $
+            (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack content)) $
                                                 return . diagFromExcep
-            diagsForClient doc $ diagErrs ++ diagWarns)
+            diagsForClient doc $ diagErrs ++ diagWarns
+            )
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
         withFilePathFromUri doc (\file -> do
             mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
+            cfg <- getConfig
             case mdoc of
                 Just vf@(VFS.VirtualFile _ version rope) -> do
-                    (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                    (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                     diagsForClient doc (diagErrs ++ diagWarns)
                 Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
@@ -199,12 +210,13 @@ handlers =
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
         withFilePathFromUri doc (\file -> do
             mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
+            cfg <- getConfig
             case mdoc of
               Just vf@(VFS.VirtualFile _ version _rope) -> do
-                (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode bsc_exe (commandOptions ++ [file]) ""
-                -- Delete stale BO file as new source is broken 
-                when (errCode /= ExitSuccess) . liftIO $ removeFile (buildDir ++ takeBaseName file ++ ".bo")
-                (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg ++ [file]) ""
+                -- Delete stale BO file as the new source is broken 
+                when (errCode /= ExitSuccess) . liftIO $ removeFile (buildDir cfg ++ takeBaseName file ++ ".bo")
+                (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                 diagsForClient doc (diagErrs ++ diagWarns)
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
@@ -245,8 +257,8 @@ main = do
                                                             J.Success v -> Right v
                                                             J.Error err -> Left $ T.pack err
                          , onConfigChange = const $ pure ()
-                         , defaultConfig = ()
-                         , configSection = "bsc-lsp" -- TODO investigate what this configSection is suppose to do
+                         , defaultConfig = Config {buildDir = buildDirDefault, bscExe = bscExeDefault }
+                         , configSection = "glscp.bsclsp" -- TODO investigate what this configSection is suppose to do
                          , doInitialize = \env _req -> pure $ Right env
                          , staticHandlers = const handlers
                          , interpretHandler = \env -> Iso (runLspT env) liftIO

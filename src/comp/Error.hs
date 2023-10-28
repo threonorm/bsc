@@ -5,6 +5,7 @@
 -- Note that the OPTIONS line must be first !!!!
 
 module Error(
+             prEMsg, serror, swarning,
              extractPosition,
              extractMessage,
              ExcepWarnErr(..),
