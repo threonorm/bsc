@@ -33,15 +33,9 @@ import qualified Data.Map as M
 -- utility libs
 import ParseOp
 -- import PFPrint
-import FileNameUtil(baseName, hasDotSuf, dropSuf, dirName, mangleFileName,
-                    mkAName, mkVName, mkVPICName,
-                    mkNameWithoutSuffix,
-                    mkSoName, mkObjName, mkMakeName,
-                    bscSrcSuffix, bseSrcSuffix, binSuffix,
-                    hSuffix, cSuffix, cxxSuffix, cppSuffix, ccSuffix,
-                    objSuffix, useSuffix,
-                    genFileName, createEncodedFullFilePath,
-                    getFullFilePath, getRelativeFilePath)
+import FileNameUtil(baseName, hasDotSuf, dropSuf, 
+                    bscSrcSuffix, bseSrcSuffix, 
+                    createEncodedFullFilePath)
 import TopUtils
 import IOUtil(getEnvDef)
 
