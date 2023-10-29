@@ -91,6 +91,7 @@ import GHC.Generics (Generic)
 -- TODO: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
 
+-- TODO: buildDir is currently custom, maybe it should be offset compared to the workspace
 data Config = Config {bscExe :: FilePath, buildDir:: FilePath}
   deriving (Generic, J.ToJSON, J.FromJSON, Show)
 
@@ -248,18 +249,13 @@ main = do
     hSetBuffering stderr LineBuffering
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
-    handle <- liftIO $ openFile "/tmp/output.txt" WriteMode
-    liftIO $ hPutStr handle "Starting LSP\n"
-    liftIO $ hClose handle
     runServer $
-        ServerDefinition { -- TODO Parse config create a dependency on AESON and is currently not really useful (as config is ())
-                           -- Still we keep it as a placeholder
-                           parseConfig = \_old new -> case J.fromJSON new of
+        ServerDefinition { parseConfig = \_old new -> case J.fromJSON new of
                                                             J.Success v -> Right v
                                                             J.Error err -> Left $ T.pack err
                          , onConfigChange = const $ pure ()
                          , defaultConfig = Config {buildDir = buildDirDefault, bscExe = bscExeDefault }
-                         , configSection = "glscp.bsclsp" -- TODO investigate what this configSection is suppose to do
+                         , configSection = "bsclsp" -- TODO investigate what this configSection is suppose to do
                          , doInitialize = \env _req -> pure $ Right env
                          , staticHandlers = const handlers
                          , interpretHandler = \env -> Iso (runLspT env) liftIO
