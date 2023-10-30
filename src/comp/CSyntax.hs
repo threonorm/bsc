@@ -58,6 +58,7 @@ module CSyntax(
         cVar,
         cVApply,
         getName,
+        definedNames,
         getLName,
         getDName,
         isTDef,
@@ -702,6 +703,26 @@ getName (CItype i _ _) = Right $ iKName i
 getName (CIclass _ _ i _ _ _) = Right $ iKName i
 getName (CIinstance _ qt) = Left $ getPosition qt
 getName (CIValueSign i _) = Right i
+
+definedNames :: CDefn -> [Id]
+definedNames (CValue i _) = [i]
+definedNames (CValueSign (CDef i _ _)) = [i]
+definedNames (CValueSign (CDefT i _ _ _)) = [i]
+definedNames (Cprimitive i _) = [i]
+definedNames (CprimType i) = [iKName i]
+definedNames (CPragma pr) = []
+definedNames (Cforeign { cforg_name = i }) = [i]
+definedNames (Ctype i _ t) = [iKName i] ++ namedCons t
+definedNames (Cdata { cd_name = name }) = [iKName name]
+definedNames (Cstruct _ _ i _ f _) = iKName i : (cf_name  <$> f)
+definedNames (Cclass _ _ i _ _ f) = iKName i : (cf_name <$> f)
+definedNames (Cinstance qt _) = []
+definedNames (CItype i _ _) = [iKName i]
+definedNames (CIclass _ _ i _ _ _) = [iKName i]
+definedNames (CIinstance _ qt) = []
+definedNames (CIValueSign i _) = [i]
+
+
 
 getDName :: CDef -> Id
 getDName (CDef i _ _) = i

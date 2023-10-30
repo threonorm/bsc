@@ -6,6 +6,7 @@ module CType(
   Type(..), CType, TyVar(..), TyCon(..), TISort(..), StructSubType(..),
 
   -- ** Examining Types
+  namedCons,
   getTyVarId, getTypeKind,
   isTNum, getTNum,
   isTStr, getTStr,
@@ -84,6 +85,11 @@ data Type = TVar TyVar         -- ^ type variable
           | TGen Position Int  -- ^ quantified type variable used in type schemes
           | TDefMonad Position -- ^ not used after CVParserImperative
     deriving (Show, Generic.Data, Generic.Typeable)
+
+namedCons :: Type -> [Id]
+namedCons (TCon x) = 
+    [tcon_name x]
+namedCons _ = []
 
 -- | Representation of a type variable
 data TyVar = TyVar { tv_name :: Id    -- ^ name of the type variable

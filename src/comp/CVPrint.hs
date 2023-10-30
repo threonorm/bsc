@@ -39,6 +39,7 @@ module CVPrint (
         mkTuple, pMkTuple,
         pvPreds,
         getName,
+        definedNames,
         getLName,
         isTDef,
         getNK,

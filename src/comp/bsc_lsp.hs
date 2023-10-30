@@ -2,6 +2,7 @@
 {-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use camelCase" #-}
+{-# HLINT ignore "Use mapMaybe" #-}
 module Main_bsc_lsp(main, hmain) where
 
 -- Haskell libs
@@ -24,7 +25,7 @@ import System.IO
 import System.Directory
     ( removeFile,
       getCurrentDirectory )
-import Data.Maybe(isJust)
+import Data.Maybe(isJust, catMaybes, fromJust, fromMaybe)
 
 import Control.Monad(when)
 import qualified Data.Map as M
@@ -33,14 +34,14 @@ import qualified Data.Map as M
 -- utility libs
 import ParseOp
 -- import PFPrint
-import FileNameUtil(baseName, hasDotSuf, dropSuf, 
-                    bscSrcSuffix, bseSrcSuffix, 
+import FileNameUtil(baseName, hasDotSuf, dropSuf,
+                    bscSrcSuffix, bseSrcSuffix,
                     createEncodedFullFilePath)
 import TopUtils
 import IOUtil(getEnvDef)
 
 -- compiler libs
---import FStringCompat
+import FStringCompat
 import Flags(
         Flags(..),
         DumpFlag(..),
@@ -54,7 +55,10 @@ import Error(ErrorHandle, ExcepWarnErr(..),
              prEMsg, swarning, serror,
              initErrorHandle, setErrorHandleFlags,
              extractPosition,  bsWarning)
-import Position(Position (..))
+import Position(Position (..), 
+        getPositionLine,
+        getPositionFile,
+        getPositionColumn)
 import CVPrint
 import Id
 import Deriving(derive)
@@ -74,7 +78,8 @@ import Language.LSP.Server
 import Language.LSP.Protocol.Message qualified as LSP
 import Language.LSP.Protocol.Types qualified as LSP
 import Language.LSP.Protocol.Lens qualified as LSP
-import Control.Monad.IO.Class (MonadIO(liftIO))
+-- import Control.Monad.IO.Class (MonadIO(liftIO))
+import Control.Monad.Trans (lift, liftIO)
 import Data.Text qualified as T
 import Data.Text.Lazy (toStrict)
 import Data.Text.Format ( format, Only(Only) )
@@ -82,11 +87,27 @@ import Language.LSP.VFS qualified as VFS
 import Control.Lens ((^.), to) -- Convenient
 import Data.Aeson qualified as J
 import GHC.IO(catchException)
+import Control.Monad.Reader (ReaderT, runReaderT, ask)
+import Control.Concurrent.MVar (MVar, newMVar, readMVar, putMVar, modifyMVar_)
 
 import Data.List qualified as L
 import Control.Monad qualified as Monad
 import PPrint qualified as P
 import GHC.Generics (Generic)
+
+-- Current limitations: 
+--  1. Errors are at the line level (no multiline errors, no
+--  end of column error).
+--  2. bsc_lsp is singlethreaded
+--  3. No support for project yaml file
+--  4. Currently every BO file is in a folder specified by the LSP client (so
+--     global for all project right now). Maybe we should instead use the
+--     project compilation folder though it may be dangerous to share BO files
+--     (there could be macro stuff for example, how should we deal with that?).
+--     If we use this the build_dir should be read from the yaml file instead of
+--     passed by the LSP client.
+--  5. TODO: Return the package and the name table as best as possible even if compilation fail (currently returns nothing)
+--  6. TODO: Currently points to the type definition for methods, instea dof the module instantiation
 
 -- TODO: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
@@ -113,7 +134,7 @@ bscExtraArgs = []
 -- In the future, the build folder should be chosen by the LSP client.
 -- As it uses standard BO file, it *might* make sense to reuse the project build
 -- folder, more thought are needed.
-buildDirDefault :: FilePath 
+buildDirDefault :: FilePath
 buildDirDefault = "/tmp/build_bsc/"
 
 
@@ -134,7 +155,7 @@ diagsForClient doc diags = sendNotification LSP.SMethod_TextDocumentPublishDiagn
 
 -- We modified the error handling of the compiler to generate an exception [ExcepWarnErr] on warnings and errors
 -- This function transform such an exception into LSP diagnostics
-diagFromExcep  :: ExcepWarnErr -> ([LSP.Diagnostic], [LSP.Diagnostic])
+diagFromExcep  :: ExcepWarnErr -> ([LSP.Diagnostic], [LSP.Diagnostic], Maybe a, Maybe b)
 diagFromExcep (ExcepWarnErr err warn ctxt) = do
     let diag =  map (\x -> let pos = extractPosition x  in
                         LSP.Diagnostic (LSP.mkRange (fromIntegral $ pos_line pos - 1) 0
@@ -153,10 +174,10 @@ diagFromExcep (ExcepWarnErr err warn ctxt) = do
                                     (T.pack . P.pretty 78 78 . prEMsg swarning ctxt $ x)
                                     -- (T.pack $ show $ extractMessage x)
                                     Nothing Nothing Nothing) warn
-    (diag, diagw)
+    (diag, diagw, Nothing, Nothing)
 
-emptyDiags :: p -> ([LSP.Diagnostic], [LSP.Diagnostic])
-emptyDiags _ = ([],[])
+emptyDiags :: (Bool, c, p) -> ([LSP.Diagnostic], [LSP.Diagnostic], Maybe c, Maybe p)
+emptyDiags (_,map, package) = ([],[], Just map, Just package)
 
 withFilePathFromUri :: MonadLsp config f => LSP.Uri -> (FilePath -> f ()) -> f ()
 withFilePathFromUri uri k =
@@ -164,12 +185,90 @@ withFilePathFromUri uri k =
         Just s -> k s
         Nothing -> logForClient . toStrict $ format "URI {} cannot be transformed into Filepath" (Only (show uri))
 
-handlers :: Handlers (LspM Config)
+updateNametable :: LSP.Uri -> Maybe (BinMap HeapData) -> Maybe CPackage-> LspState ()
+updateNametable doc maybepackage cpackage =
+    Monad.forM_ maybepackage (\m -> do
+                        stRef <- lift ask
+                        let defs_public_aux = L.map (\(x,y,z,t,u) -> y) $ M.elems m
+                            defs_public = L.concatMap (\(CSignature _namePackage _imported _fixity defs) ->
+                                                        L.concatMap definedNames defs) defs_public_aux
+                            fulldefs_local = fromMaybe [] ((\(CPackage _ _ _ _ defns _) -> defns) <$> cpackage )
+                            defs_local = L.concatMap definedNames fulldefs_local 
+                            all_defs = defs_local ++ defs_public -- Might contain duplicate
+                            -- keys_debug = M.keys m
+                            -- EDIT: After investigation, the BinMap does not
+                            -- contain the toplevel module, we should return all
+                            -- this information from the CPackage in the
+                            -- compilation function that's for
+                            -- later 
+
+                        --logForClient . T.pack . show $ keys_debug
+                        -- TODO: Is the following going to create a memory leak? It should get properly GCed double check
+                        liftIO . modifyMVar_ stRef $ \x ->
+                                                    return $ x{visible_global_identifiers = M.insert
+                                                                    doc all_defs (visible_global_identifiers x)})
+
+type LspState = LspT Config (ReaderT (MVar ServerState) IO)
+
+newtype ServerState = ServerState {
+    -- Currently easy implementation for global identifiers, 
+    -- To avoid ambiguities of goto definitions because different
+    -- packages could import packages that define the same identifier
+    -- we keep one Id position table per Uri defined
+
+    -- TODO: This loose sharing when a module is imported twice,  see if we can
+    -- maintain a single map Id -> Position
+    -- TODO: UI question - what to do when file does not compile, should we 
+    -- keep the old mapping or delete it? 
+    -- Currently leaning toward keeping the old mapping.
+    visible_global_identifiers :: M.Map LSP.Uri [Id]
+
+    -- In the future, this type should carry:
+    -- TODO Add documentations 
+    -- TODO Add Uri -> NonGlobalDefinitions even for broken files
+    -- TODO Add all references to Id? Id -> [(Uri, Position)]
+}
+
+idAtPos :: LSP.Position -> T.Text -> Maybe (Int, (Int, Int), T.Text)
+idAtPos pos text =
+    -- the id is necessarily on a single line first extract the line
+    let line_n :: Int = fromIntegral $ pos ^. LSP.line 
+        column_n :: Int = fromIntegral $ pos ^. LSP.character
+        line = T.lines text L.!! line_n in
+    (\(x,y,z) -> (line_n, (x,y), z)) <$> extractWordAroundPosition column_n line
+
+extractWordAroundPosition :: Int -> T.Text -> Maybe (Int, Int, T.Text)
+extractWordAroundPosition position text = case findWordBoundaries position text of
+    Just (start, end) -> Just (start, end, T.take (end - start) (T.drop start text))
+    Nothing           -> Nothing
+
+findWordBoundaries :: Int -> T.Text -> Maybe (Int, Int)
+findWordBoundaries position text = do
+    let (before, after) = T.splitAt position text
+    let start = T.length (T.takeWhile isWordChar (T.reverse before))
+    let end = T.length (T.takeWhile isWordChar after) + position 
+    return (position - start, end)
+
+isWordChar :: Char -> Bool
+isWordChar c = c `elem` ['a'..'z'] || c `elem` ['A'..'Z'] || c `elem` ['0'..'9']
+
+bscPosToLSPPos :: (Int, (Int,Int)) -> Position -> LSP.DefinitionLink
+bscPosToLSPPos (l ,(start,end)) pos = 
+    let line_target =  fromIntegral $ getPositionLine pos
+        range = LSP.Range (LSP.Position line_target 0) (LSP.Position line_target 1000) in
+    LSP.DefinitionLink $ LSP.LocationLink 
+        (Just . LSP.Range (LSP.Position (fromIntegral l) (fromIntegral start)) $ LSP.Position (fromIntegral l) (fromIntegral end))
+        (LSP.filePathToUri $ getPositionFile pos) 
+        range
+        range --(LSP.filePathToUri $ getPositionFile pos) _
+
+-- handlers :: Handlers (LspM Config)
+handlers :: Handlers LspState
 handlers =
   mconcat
 --   Add handler for completion
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
-        cfg <- getConfig 
+        cfg <- getConfig
         logForClient . toStrict $ format "BSC LSP Server Initialized {} " (Only (show cfg))
     , notificationHandler LSP.SMethod_WorkspaceDidChangeConfiguration $ \_dummy -> do
         -- See Note about LSP configuration in the haskell lsp package
@@ -192,9 +291,10 @@ handlers =
             -- importing submodules, typechecking, etc...), an exception is
             -- raised by the compiler.  We catch this exception here  and we
             -- display it as diagnostic
-            (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack content)) $
+            (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack content)) $
                                                 return . diagFromExcep
             diagsForClient doc $ diagErrs ++ diagWarns
+            updateNametable doc maybeNameTable maybePackage
             )
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
@@ -203,9 +303,10 @@ handlers =
             cfg <- getConfig
             case mdoc of
                 Just vf@(VFS.VirtualFile _ version rope) -> do
-                    (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                    (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                     diagsForClient doc (diagErrs ++ diagWarns)
+                    updateNametable doc maybeNameTable maybePackage
                 Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
     , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
@@ -217,25 +318,40 @@ handlers =
                 (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg ++ [file]) ""
                 -- Delete stale BO file as the new source is broken 
                 when (errCode /= ExitSuccess) . liftIO $ removeFile (buildDir cfg ++ takeBaseName file ++ ".bo")
-                (diagErrs, diagWarns) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                 diagsForClient doc (diagErrs ++ diagWarns)
+                updateNametable doc maybeNameTable maybePackage
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
-    -- , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
-    --     let pos = req ^. LSP.params . LSP.position -- pos is a position in teh document
-    --         uri = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
-    --     -- TODO
-    --     -- Make a state monad that contains the compiled modules so far and their public identifier
-    --     -- For local identifiers, also query the VFS to get the current file, to know what identifier is at the position pos.
-    --     -- for that we will probably need to index what BSC produced, to build a table for the current file.
-    --     -- We will want to build the indexed table (Identifier <-> [positions])
-    --     -- (Note: Could be several definitions?)
-    --     defs <- undefined
-    --     responder $ undefined
+    , requestHandler LSP.SMethod_TextDocumentDefinition $ \req responder -> do
+        let pos = req ^. LSP.params . LSP.position -- pos is a position in the document
+            doc = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
+        withFilePathFromUri doc (\file -> do
+            mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
+            cfg <- getConfig
+            case mdoc of
+              Just vf@(VFS.VirtualFile _ version _rope) -> do
+                    stRef <- lift ask
+                    serverState <- liftIO $ readMVar stRef
+                    case M.lookup doc $ visible_global_identifiers serverState of
+                        Just ids -> do
+                            let add_key = (\id -> (getIdBase id, id)) <$> ids
+                                searched = idAtPos pos (VFS.virtualFileText vf)
+                                find_ids = L.nub $ snd <$> L.filter (\(key,v) -> toString key == T.unpack ( (\(x,y,z) -> z) .  fromMaybe (-1, (-1,-1), "_unused_42") $ searched)) add_key
+
+                            logForClient . toStrict $  format "Search {} Several defs {} return the first one" (show searched, show find_ids)
+                            if null find_ids then 
+                                responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
+                            else do
+                                when (length find_ids /= 1) .
+                                    logForClient . toStrict $  format "Several defs {} return the first one" (Only $ show find_ids)
+                                responder . Right $ LSP.InR $ LSP.InL $ bscPosToLSPPos ((\(l,(cs,ce),z)-> (l,(cs,ce))) $ fromJust searched) <$> getIdPosition  <$> (find_ids)
+                        Nothing -> responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
+              Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
 
     -- -- TODO: Investigate if the notion of documentation is understood internally by the BSC compiler
     -- , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
-    
+
     -- -- TODO: I don't know what SetTrace is used for, but vscode keeps sending
     -- those event, so we make a dummy handler.
     , notificationHandler LSP.SMethod_SetTrace $ \msg -> do
@@ -243,12 +359,21 @@ handlers =
     ]
 
 
+
+initialServerState :: IO (MVar ServerState)
+initialServerState = do
+    newMVar ServerState{ visible_global_identifiers = M.empty }
+
+runLSPAndState :: LspState a  -> MVar ServerState -> LanguageContextEnv Config ->  IO a
+runLSPAndState lsp state env = runReaderT (runLspT env lsp) state
+
 main :: IO Int
 main = do
     hSetBuffering stdout LineBuffering
     hSetBuffering stderr LineBuffering
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
+    state <- initialServerState
     runServer $
         ServerDefinition { parseConfig = \_old new -> case J.fromJSON new of
                                                             J.Success v -> Right v
@@ -258,7 +383,8 @@ main = do
                          , configSection = "bsclsp" -- TODO investigate what this configSection is suppose to do
                          , doInitialize = \env _req -> pure $ Right env
                          , staticHandlers = const handlers
-                         , interpretHandler = \env -> Iso (runLspT env) liftIO
+                        --  , interpretHandler = \env -> Iso (runLspT env) liftIO
+                         , interpretHandler = \env -> Iso (\lsp -> runLSPAndState lsp state env) liftIO
                          , options = defaultOptions { -- set sync options to get DidSave event, as well as Open and Close events.
                                              optTextDocumentSync =
                                                Just
@@ -273,7 +399,8 @@ main = do
 
 
 -- Use with hugs top level
-hmain :: [String] -> String -> IO Bool
+-- hmain :: [String] -> String -> IO Bool
+hmain :: [String] -> String -> IO (Bool, BinMap HeapData, CPackage)
 hmain args contentFile = do
     pprog <- getProgName
     cdir <- getEnvDef "BLUESPECDIR" dfltBluespecDir
@@ -301,7 +428,8 @@ hmain args contentFile = do
         _ -> error "Internal error bsc_lsp"
 
 
-main' :: ErrorHandle -> Flags -> String -> String -> IO Bool
+-- main' :: ErrorHandle -> Flags -> String -> String -> IO Bool
+main' :: ErrorHandle -> Flags -> String -> String -> IO (Bool, BinMap HeapData, CPackage)
 main' errh flags name contentFile =  do
     setErrorHandleFlags errh flags
     tStart <- getNow
@@ -314,14 +442,15 @@ main' errh flags name contentFile =  do
     comp errh flags name contentFile
 
 
-compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO Bool
+-- compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO Bool
+compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO (Bool, BinMap HeapData, CPackage)
 compile_no_deps errh flags name contentFile = do
-  (ok, _, _) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
-  return ok
+  (ok, loaded, _, cpackage) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
+  return (ok, loaded, cpackage)
 
 -- returns whether the compile errored or not
 compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String -> String ->
-               IO (Bool, BinMap HeapData, HashMap)
+               IO (Bool, BinMap HeapData, HashMap, CPackage)
 compileFile errh flags binmap hashmap name_orig file = do
 
     handle <- openFile "/tmp/output.txt" AppendMode
@@ -354,7 +483,7 @@ compilePackage ::
     HashMap ->
     String ->
     CPackage ->
-    IO (Bool, BinMap HeapData, HashMap)
+    IO (Bool, BinMap HeapData, HashMap, CPackage)
 compilePackage
     errh
     flags                -- user switches
@@ -464,7 +593,7 @@ compilePackage
 
     --putStr (ppReadable mod)
     t <- dump errh flags t DFtypecheck dumpnames mod
-    return ( not tcErrors, binmap, hashmap)
+    return ( not tcErrors, binmap, hashmap, mod)
 
 
 -- Our server should compile subpackets
