@@ -65,11 +65,15 @@ module CSyntax(
         getNK,
         isCQFilter,
         HasPosition(..),
-        StructSubType(..)) where
+        StructSubType(..),
+        extractStructT,
+        extractStructTClause,
+        extractStructTDef,
+        extractStructTDelf) where
 
-#if defined(__GLASGOW_HASKELL__) && (__GLASGOW_HASKELL__ >= 804)
+
 import Prelude hiding ((<>))
-#endif
+
 
 import Data.Char(isAlpha)
 import Data.List(intercalate, genericReplicate)
@@ -255,6 +259,30 @@ data CExpr
         -- for passing pprops as values
         | Cattributes [(Position,PProp)]
         deriving (Ord, Show)
+
+-- Useful to know where modules are being defined, as module define structs
+extractStructT :: CExpr -> [CExpr]
+extractStructT (Cletseq l b) = extractStructT b ++ concatMap extractStructTDelf l
+extractStructT (Cletrec l b) = extractStructT b ++ concatMap extractStructTDelf l
+-- extractStructT (CSelect b _) = extractStructT b
+-- extractStructT (CCon id l) = concatMap extractStructT l
+-- Lazy from there I forward
+extractStructT (CApply a b) = extractStructT a ++ concatMap extractStructT b
+extractStructT (CStructT a b) = [CStructT a b]
+extractStructT _ = []
+
+extractStructTDelf :: CDefl -> [CExpr]
+extractStructTDelf (CLValueSign def  _) =  extractStructTDef def
+extractStructTDelf (CLValue _ clauses _) = concatMap extractStructTClause clauses
+extractStructTDelf (CLMatch _ e) = extractStructT e
+
+extractStructTDef :: CDef -> [CExpr]
+extractStructTDef (CDef _ _ cclauses) = concatMap extractStructTClause cclauses
+extractStructTDef (CDefT _ _ _ cclauses)  = concatMap extractStructTClause cclauses
+
+extractStructTClause :: CClause -> [CExpr]
+extractStructTClause  (CClause _ _ c) =
+    extractStructT c
 
 instance Hyper CExpr where
     hyper x y = (x==x) `seq` y                -- XXX
@@ -714,14 +742,13 @@ definedNames (CPragma pr) = []
 definedNames (Cforeign { cforg_name = i }) = [i]
 definedNames (Ctype i _ t) = [iKName i] ++ namedCons t
 definedNames (Cdata { cd_name = name }) = [iKName name]
-definedNames (Cstruct _ _ i _ f _) = iKName i : (cf_name  <$> f)
-definedNames (Cclass _ _ i _ _ f) = iKName i : (cf_name <$> f)
+definedNames (Cstruct _ _ i _ f _) = [iKName i] ++ (cf_name  <$> f)
+definedNames (Cclass _ _ i _ _ f) = [iKName i]  ++ (cf_name <$> f)
 definedNames (Cinstance qt _) = []
 definedNames (CItype i _ _) = [iKName i]
 definedNames (CIclass _ _ i _ _ _) = [iKName i]
 definedNames (CIinstance _ qt) = []
 definedNames (CIValueSign i _) = [i]
-
 
 
 getDName :: CDef -> Id
@@ -903,23 +930,23 @@ instance HasPosition CInternalSummand where
 
 ppExports :: PDetail -> Either [CExport] [CExport] -> Doc
 ppExports d (Right []) = empty
-ppExports d (Right noexps) = t " hiding (" <> sepList (map (pp d) noexps) (t",") <> t")"
-ppExports d (Left exports) = t "(" <> sepList (map (pp d) exports) (t",") <> t")"
+ppExports d (Right noexps) = t " hiding (" <> sepList (map (pp d) noexps) (t ",") <> t ")"
+ppExports d (Left exports) = t "(" <> sepList (map (pp d) exports) (t ",") <> t ")"
 
 instance PPrint CPackage where
     pPrint d _ (CPackage i exps imps fixs def includes) =
-        (t"package" <+> ppConId d i <> ppExports d exps <+> t "where {") $+$
+        (t "package" <+> ppConId d i <> ppExports d exps <+> t "where {") $+$
         pBlock d 0 True (map (pp d) imps ++ map (pp d) fixs ++ map (pp d) def ++ map (pp d) includes)
 
 instance PPrint CExport where
     pPrint d p (CExpVar i) = ppVarId d i
     pPrint d p (CExpCon i) = ppConId d i
-    pPrint d p (CExpConAll i) = ppConId d i <> t"(..)"
-    pPrint d p (CExpPkg i) = t"package" <+> ppId d i
+    pPrint d p (CExpConAll i) = ppConId d i <> t "(..)"
+    pPrint d p (CExpPkg i) = t "package" <+> ppId d i
 
 instance PPrint CImport where
-    pPrint d p (CImpId q i) = t"import" <+> ppQualified q <+> ppConId d i
-    pPrint d p (CImpSign _ q (CSignature i _ _ _)) = t"import" <+> ppQualified q <+> ppConId d i <+> t "..."
+    pPrint d p (CImpId q i) = t "import" <+> ppQualified q <+> ppConId d i
+    pPrint d p (CImpSign _ q (CSignature i _ _ _)) = t "import" <+> ppQualified q <+> ppConId d i <+> t "..."
 
 ppQualified :: Bool -> Doc
 ppQualified True = text "qualified"
@@ -927,9 +954,9 @@ ppQualified False = empty
 
 instance PPrint CSignature where
     pPrint d _ (CSignature i imps fixs def) =
-        (t"signature" <+> ppConId d i <+> t "where" <+> t "{") $+$
+        (t "signature" <+> ppConId d i <+> t "where" <+> t "{") $+$
         pBlock d 0 True (map pi imps ++ map (pp d) fixs ++ map (pp d) def)
-      where pi i = t"import" <+> ppConId d i
+      where pi i = t "import" <+> ppConId d i
 
 instance PPrint CFixity where
     pPrint d _ (CInfix  p i) = text "infix"  <+> text (show p) <+> ppInfix d i
@@ -938,7 +965,7 @@ instance PPrint CFixity where
 
 instance PPrint CDefn where
     pPrint d p (Ctype i as ty) =
-        sep [sep ((t"type" <+> ppConIdK d i) : map (nest 2 . ppVarId d) as) <+> t "=",
+        sep [sep ((t "type" <+> ppConIdK d i) : map (nest 2 . ppVarId d) as) <+> t "=",
                   nest 2 (pp d ty)]
     pPrint d p (Cdata { cd_visible = vis,
                         cd_name = i,
@@ -946,59 +973,59 @@ instance PPrint CDefn where
                         cd_original_summands = cs@(_:_),
                         cd_internal_summands = [],
                         cd_derivings = ds }) =                -- a hack to print original constructors
-        sep [sep ((t"data" <+> ppConIdK d i) : map (nest 2 . ppVarId d) as) <> t(if vis then " =" else " =="),
+        sep [sep ((t "data" <+> ppConIdK d i) : map (nest 2 . ppVarId d) as) <> t (if vis then " =" else " =="),
                   nest 2 (ppOSummands d cs)]
     pPrint d p (Cdata { cd_visible = vis,
                         cd_name = i,
                         cd_type_vars = as,
                         cd_internal_summands = cs,
                         cd_derivings = ds }) =
-        sep [sep ((t"data" <+> ppConIdK d i) : map (nest 2 . ppVarId d) as) <> t(if vis then " =" else " =="),
+        sep [sep ((t "data" <+> ppConIdK d i) : map (nest 2 . ppVarId d) as) <> t (if vis then " =" else " =="),
                   nest 2 (ppSummands d cs)]
         <> ppDer d ds
     pPrint d p (Cstruct vis (SInterface prags) i as fs ds) =
-        (t("interface ") <> sep (ppConIdK d i : map (nest 2 . ppVarId d) as) <+> ppIfcPragma d prags <+> t(if vis then "= {" else "== {")) $+$
+        (t ("interface ") <> sep (ppConIdK d i : map (nest 2 . ppVarId d) as) <+> ppIfcPragma d prags <+> t (if vis then "= {" else "== {")) $+$
         pBlock d 4 False (map (ppField d) fs) <> ppDer d ds
     pPrint d p (Cstruct vis ss i as fs ds) =
-        (t("struct ") <> sep (ppConIdK d i : map (nest 2 . ppVarId d) as) <+> t(if vis then "= {" else "== {")) $+$
+        (t ("struct ") <> sep (ppConIdK d i : map (nest 2 . ppVarId d) as) <+> t (if vis then "= {" else "== {")) $+$
         pBlock d 4 False (map (ppField d) fs) <> ppDer d ds
     pPrint d p (Cclass incoh ps ik is fd ss) =
         (t_cls <+> ppPreds d ps (sep (ppConIdK d ik : map (ppVarId d) is)) <> ppFDs d fd <+> t "where {") $+$
         pBlock d 4 False (map (ppField d) ss)
       where t_cls = case incoh of
-                     Just False -> t"class coherent"
-                     Just True  -> t"class incoherent"
-                     Nothing    -> t"class"
+                     Just False -> t "class coherent"
+                     Just True  -> t "class incoherent"
+                     Nothing    -> t "class"
     pPrint d p (Cinstance qt ds) =
-        (t"instance" <+> pPrint d 0 qt <+> t "where {") $+$
+        (t "instance" <+> pPrint d 0 qt <+> t "where {") $+$
         pBlock d 4 False (map (pPrint d 0) ds)
     pPrint d p (CValueSign def) = pPrint d p def
     pPrint d p (CValue i cs) =
-        vcat (map (\ cl -> ppClause d p [ppVarId d i] cl <> t";") cs)
+        vcat (map (\ cl -> ppClause d p [ppVarId d i] cl <> t ";") cs)
     pPrint d p (Cprimitive i ty) =
         text "primitive" <+> ppVarId d i <+> t "::" <+> pp d ty
     pPrint d p (CPragma pr) = pPrint d p pr
     pPrint d p (CprimType ik) =
-        t"primitive type" <+>
+        t "primitive type" <+>
         -- don't use ppConIdK because this syntax has no parentheses
         case (ik) of
             (IdK i)        -> ppConId d i
             (IdKind i k)   -> ppConId d i <+> t "::" <+> pp d k
             (IdPKind i pk) -> ppConId d i <+> t "::" <+> pp d pk
     pPrint d p (Cforeign i ty oname opnames) =
-        text "foreign" <+> ppVarId d i <+> t "::" <+> pp d ty <> (case oname of Nothing -> text ""; Just s -> text (" = " ++ show s)) <> (case opnames of Nothing -> text ""; Just (is, os) -> t"," <> pparen True (sep (map (text . show) is ++ po os)))
+        text "foreign" <+> ppVarId d i <+> t "::" <+> pp d ty <> (case oname of Nothing -> text ""; Just s -> text (" = " ++ show s)) <> (case opnames of Nothing -> text ""; Just (is, os) -> t "," <> pparen True (sep (map (text . show) is ++ po os)))
       where po [o] = [text ",", text (show o)]
-            po os = [t"(" <> sepList (map (text . show) os) (t",") <> t ")"]
+            po os = [t "(" <> sepList (map (text . show) os) (t ",") <> t ")"]
     pPrint d p (CIinstance i qt) =
-        t"instance" <+> ppConId d i <+> pPrint d 0 qt
+        t "instance" <+> ppConId d i <+> pPrint d 0 qt
     pPrint d p (CItype i as positions) =
-        sep (t"type" <+> ppConIdK d i : map (nest 2 . ppVarId d) as)
+        sep (t "type" <+> ppConIdK d i : map (nest 2 . ppVarId d) as)
     pPrint d p (CIclass incoh ps ik is fd positions) =
         t_cls <+> ppPreds d ps (sep (ppConIdK d ik : map (nest 2 . ppVarId d) is)) <> ppFDs d fd
       where t_cls = case incoh of
-                     Just False -> t"class coherent"
-                     Just True  -> t"class incoherent"
-                     Nothing    -> t"class"
+                     Just False -> t "class coherent"
+                     Just True  -> t "class incoherent"
+                     Nothing    -> t "class"
     pPrint d p (CIValueSign i ty) = ppVarId d i <+> t "::" <+> pp d ty
 
 instance PPrint CField where
@@ -1028,7 +1055,7 @@ ppIfcPragma detail ps =
 
 ppFDs :: PDetail -> CFunDeps -> Doc
 ppFDs d [] = empty
-ppFDs d fd = text " |" <+> sepList (map (ppFD d) fd) (t",")
+ppFDs d fd = text " |" <+> sepList (map (ppFD d) fd) (t ",")
 
 ppFD :: PDetail -> ([Id], [Id]) -> Doc
 ppFD d (as,rs) = sep (ppVarId d <$> as) <+> t "->" <+> sep (ppVarId d <$> rs)
@@ -1048,11 +1075,11 @@ instance PPrint IdK where
     pPrint d p (IdPKind i pk) = pparen True $ pp d i <+> t "::" <+> pp d pk
 
 pBlock :: PDetail -> Int -> Bool -> [Doc] -> Doc
-pBlock _ n _ [] = t"}"
+pBlock _ n _ [] = t "}"
 pBlock _ n nl xs =
         (t (replicate n ' ') <>
-        foldr1 ($+$) (map (\ x -> x <> if nl then t";" $+$ t"" else t";") (init xs) ++ [last xs])) $+$
-        t"}"
+        foldr1 ($+$) (map (\ x -> x <> if nl then t ";" $+$ t "" else t ";") (init xs) ++ [last xs])) $+$
+        t "}"
 
 ppDer :: PDetail -> [CTypeclass] -> Doc
 ppDer d [] = text ""
@@ -1063,25 +1090,25 @@ instance PPrint CExpr where
     pPrint d p (CLam ei e) = ppQuant "\\ "  d p ei e
     pPrint d p (CLamT ei ty e) = ppQuant "\\ "  d p ei e
     pPrint d p (Cletseq [] e) = pparen (p > 0) $
-        (t"letseq in" <+> pp d e)
+        (t "letseq in" <+> pp d e)
     pPrint d p (Cletseq ds e) = pparen (p > 0) $
-        (t"letseq" <+> text "{" <+> foldr1 ($+$) (map (pp d) ds)) <+> text "}" $+$
-        (t"in  " <> pp d e)
+        (t "letseq" <+> text "{" <+> foldr1 ($+$) (map (pp d) ds)) <+> text "}" $+$
+        (t "in  " <> pp d e)
     pPrint d p (Cletrec [] e) = pparen (p > 0) $
-        (t"let in" <+> pp d e)
+        (t "let in" <+> pp d e)
     pPrint d p (Cletrec ds e) = pparen (p > 0) $
-        (t"let" <+> text "{" <+> foldr1 ($+$) (map (pp d) ds)) <+> text "}" $+$
-        (t"in  " <> pp d e)
-    pPrint d p (CSelect e i) = pparen (p > (maxPrec+2)) $ pPrint d (maxPrec+2) e <> t"." <> ppVarId d i
+        (t "let" <+> text "{" <+> foldr1 ($+$) (map (pp d) ds)) <+> text "}" $+$
+        (t "in  " <> pp d e)
+    pPrint d p (CSelect e i) = pparen (p > (maxPrec+2)) $ pPrint d (maxPrec+2) e <> t "." <> ppVarId d i
     pPrint d p (CCon i []) = ppConId d i
     pPrint d p (CCon i es) = pPrint d p (CApply (CCon i []) es)
     pPrint d p (Ccase pos e arms) = pparen (p > 0) $ ppCase d e arms
     pPrint d p (CAny {}) = text "_"
     pPrint d p (CVar i) = ppVarId d i
     pPrint d p (CStruct _ tyc []) | tyc == idPrimUnit = text "()"
-    pPrint d p (CStruct _ tyc ies) = pparen (p > 0) $ pPrint d (maxPrec+1) tyc <+> t "{" <+> sepList (map f ies ++ [t"}"]) (t";")
+    pPrint d p (CStruct _ tyc ies) = pparen (p > 0) $ pPrint d (maxPrec+1) tyc <+> t "{" <+> sepList (map f ies ++ [t "}"]) (t ";")
         where f (i, e) = ppVarId d i <+> t "=" <+> pp d e
-    pPrint d p (CStructUpd e ies) = pparen (p > 0) $ pPrint d (maxPrec+1) e <+> t "{" <+> sepList (map f ies ++ [t"}"]) (t";")
+    pPrint d p (CStructUpd e ies) = pparen (p > 0) $ pPrint d (maxPrec+1) e <+> t "{" <+> sepList (map f ies ++ [t "}"]) (t ";")
         where f (i, e) = ppVarId d i <+> t "=" <+> pp d e
     pPrint d p (Cwrite _ e v)  = pparen (p > 0) $ pPrint d (maxPrec+1) e <+> t ":=" <+> pPrint d p v
     pPrint PDReadable p (CApply e []) = pPrint PDReadable p e
@@ -1098,21 +1125,21 @@ instance PPrint CExpr where
     pPrint d p (CLit l) = pPrint d p l
     pPrint d p (CBinOp e1 i e2) = ppOp d p i e1 e2
     pPrint d p (CHasType e t) = pparen (p>0) $ pPrint d maxPrec e <> text "::" <> pPrint d maxPrec t
-    pPrint d p (Cif pos c tr e) = pparen (p>0) (sep [t"if" <+> pp d c <+> t "then", nest 4 (pp d tr), t"else", nest 4 (pp d e)])
-    pPrint d p (CSub pos e s) = pPrint d maxPrec e <> t"[" <> pp d s <> t"]"
-    pPrint d p (CSub2 e h l) = pPrint d maxPrec e <> t"[" <> pp d h <> t":" <> pp d l <> t"]"
-    pPrint d p (CSubUpdate pos e (h, l) rhs) = pPrint d p (CSub2 e h l) <> t"=" <> pPrint d maxPrec rhs
-    pPrint d p (Cmodule _ is) = t"module {" $+$ pBlock d 2 False (map (pp d) is)
+    pPrint d p (Cif pos c tr e) = pparen (p>0) (sep [t "if" <+> pp d c <+> t "then", nest 4 (pp d tr), t "else", nest 4 (pp d e)])
+    pPrint d p (CSub pos e s) = pPrint d maxPrec e <> t "[" <> pp d s <> t "]"
+    pPrint d p (CSub2 e h l) = pPrint d maxPrec e <> t "[" <> pp d h <> t ":" <> pp d l <> t "]"
+    pPrint d p (CSubUpdate pos e (h, l) rhs) = pPrint d p (CSub2 e h l) <> t "=" <> pPrint d maxPrec rhs
+    pPrint d p (Cmodule _ is) = t "module {" $+$ pBlock d 2 False (map (pp d) is)
     pPrint d p (Cinterface pos Nothing ds) =
-        pparen (p>0) (t"interface {" $+$ pBlock d 2 False (map (pp d) ds))
+        pparen (p>0) (t "interface {" $+$ pBlock d 2 False (map (pp d) ds))
     pPrint d p (Cinterface pos (Just i) ds) =
-        pparen (p>0) (t"interface" <+> pp d i <+> t "{" $+$ pBlock d 2 False (map (pp d) ds))
+        pparen (p>0) (t "interface" <+> pp d i <+> t "{" $+$ pBlock d 2 False (map (pp d) ds))
     pPrint d p (CmoduleVerilog m ui c r ses fs sch ps) =
         sep [
-          t"module verilog" <+> pp d m <+>
-          pp d c <> t"" <+> pp d r <+> t"",
-          nest 4 (if null ses then t"" else pparen True (sepList (map ppA ses) (t","))),
-          nest 4 (t"{" $+$ pBlock d 2 False (map f fs)),
+          t "module verilog" <+> pp d m <+>
+          pp d c <> t "" <+> pp d r <+> t "",
+          nest 4 (if null ses then t "" else pparen True (sepList (map ppA ses) (t ","))),
+          nest 4 (t "{" $+$ pBlock d 2 False (map f fs)),
           nest 4 (pp d sch) ]
           where mfi s Nothing = empty
                 mfi s (Just i) = t s <+> ppVarId d i
@@ -1126,23 +1153,23 @@ instance PPrint CExpr where
                 f (Method i mc mr n ps mo me) =
                     ppVarId d i <> g n <+> t "=" <+> t (unwords (map h ps)) <+>
                     mfi "clocked_by" mc <+> mfi "reset_by" mr <+> mfp "output" mo <+> mfp "enable" me
-                g 1 = t""
-                g n = t("[" ++ itos n ++ "]")
+                g 1 = t ""
+                g n = t ("[" ++ itos n ++ "]")
                 h (s,[]) = show s
                 h (s,ps) = show s ++ "{" ++ intercalate "," (map (drop 2 . show) ps) ++ "}"
                 ppA (ai, e) = text "(" <> text (ppReadable ai) <> text "," <+> pp d e <> text ")"
     pPrint d p (CForeignFuncC i wrap_ty) =
         -- There's no real Classic syntax for this:
-        t"ForeignFuncC" <+> pp d i
-    pPrint d p (Cdo _ ss) = pparen (p>0) $ t "do" <+> t "{" <+> sepList (map (pPrint d 0) ss ++ [t"}"]) (t";")
-    pPrint d p (Caction _ ss) = pparen (p>0) $ t "action" <+> t "{" <+> sepList (map (pPrint d 0) ss ++ [t"}"]) (t";")
-    pPrint d p (Crules [] rs) = pparen (p>0) $ t"rules {" $+$ pBlock d 2 False (map (pp d) rs)
+        t "ForeignFuncC" <+> pp d i
+    pPrint d p (Cdo _ ss) = pparen (p>0) $ t "do" <+> t "{" <+> sepList (map (pPrint d 0) ss ++ [t "}"]) (t ";")
+    pPrint d p (Caction _ ss) = pparen (p>0) $ t "action" <+> t "{" <+> sepList (map (pPrint d 0) ss ++ [t "}"]) (t ";")
+    pPrint d p (Crules [] rs) = pparen (p>0) $ t "rules {" $+$ pBlock d 2 False (map (pp d) rs)
     pPrint d p (Crules ps rs) = pPrint d p ps $+$
-                                (pparen (p>0) $ t"rules {" $+$ pBlock d 2 False (map (pp d) rs))
+                                (pparen (p>0) $ t "rules {" $+$ pBlock d 2 False (map (pp d) rs))
     pPrint d p (COper ops) = pparen (p > maxPrec-1) (sep (map (pPrint d (maxPrec-1)) ops))
     ----
     pPrint d p (CCon1 _ i e) = pPrint d p (CCon i [e])
-    pPrint d p (CSelectTT _ e i) = pparen (p > (maxPrec+2)) $ pPrint d (maxPrec+2) e <> t"." <> ppVarId d i
+    pPrint d p (CSelectTT _ e i) = pparen (p > (maxPrec+2)) $ pPrint d (maxPrec+2) e <> t "." <> ppVarId d i
     ----
     pPrint d p (CCon0 _ i) = ppConId d i
     ----
@@ -1153,10 +1180,10 @@ instance PPrint CExpr where
     pPrint d p (CLitT _ l) = pPrint d p l
     pPrint d p (CAnyT pos uk t) = text "_"
     pPrint d p (CmoduleVerilogT _ m ui c mr ses fs sch ps) = pPrint d p (CmoduleVerilog m ui c mr ses fs sch ps)
-    pPrint d p (CForeignFuncCT i prim_ty) = t"ForeignFuncC" <+> pp d i
+    pPrint d p (CForeignFuncCT i prim_ty) = t "ForeignFuncC" <+> pp d i
     pPrint d p (CTApply e ts) = pparen (p>(maxPrec-1)) $
         sep (pPrint d (maxPrec-1) e : map (nest 2 . ppApArg) ts)
-        where ppApArg ty = t"\183" <> pPrint d maxPrec ty
+        where ppApArg ty = t "\183" <> pPrint d maxPrec ty
     pPrint d p (Cattributes pps) = pparen True $ text "Attributes" <+> pPrint d 0 (map snd pps)
 
 instance PPrint CLiteral where
@@ -1181,7 +1208,7 @@ instance PPrint CMStmt where
     pPrint d p (CMStmt s) = pPrint d p s
     pPrint d p (CMrules e) = pPrint d p e
     pPrint d p (CMinterface e) = pPrint d p (cVApply (idReturn (getPosition e)) [e])
-    pPrint d p (CMTupleInterface _ es) = text"(" <> sepList (map (pPrint d p) es) (text ",") <> text ")"
+    pPrint d p (CMTupleInterface _ es) = text "(" <> sepList (map (pPrint d p) es) (text ",") <> text ")"
 
 instance PPrint COp where
     pPrint d _ (CRand p) = pp d p
@@ -1195,7 +1222,7 @@ ppQuant s d p ei e =
 
 ppCase :: PDetail -> CExpr -> [CCaseArm] -> Doc
 ppCase detail scrutinee arms =
-    (t"case" <+> pp detail scrutinee <+> t "of {") $+$
+    (t "case" <+> pp detail scrutinee <+> t "of {") $+$
     pBlock detail 0 False (map ppArm arms)
   where ppArm arm =
             sep [pPrint detail 0 (cca_pattern arm) <>
@@ -1204,7 +1231,7 @@ ppCase detail scrutinee arms =
 
 ppOp :: PDetail -> Int -> Id -> CExpr -> CExpr -> Doc
 ppOp d pd i p1 p2 =
-        pparen (pd > 0) (sep [pPrint d 1 p1 <> t"" <+> ppInfix d i, pPrint d 1 p2])
+        pparen (pd > 0) (sep [pPrint d 1 p1 <> t "" <+> ppInfix d i, pPrint d 1 p2])
 {-
         let (p, lp, rp) =
                 case getFixity i of
@@ -1216,11 +1243,11 @@ ppOp d pd i p1 p2 =
 -}
 
 ppQuals :: PDetail -> [CQual] -> Doc
-ppQuals d [] = t""
-ppQuals d qs = t" when" <+> sepList (map (pp d) qs) (t",")
+ppQuals d [] = t ""
+ppQuals d qs = t " when" <+> sepList (map (pp d) qs) (t ",")
 
 ppOSummands :: PDetail -> [COriginalSummand] -> Doc
-ppOSummands d cs = sepList (map (nest 2 . ppOCon) cs) (t" |")
+ppOSummands d cs = sepList (map (nest 2 . ppOCon) cs) (t " |")
   where ppOCon summand =
             let pp_name = case (cos_names summand) of
                             [cn] -> ppConId d cn
@@ -1236,7 +1263,7 @@ ppOSummands d cs = sepList (map (nest 2 . ppOCon) cs) (t" |")
             in  sep (pp_name : pp_encoding : pp_args)
 
 ppSummands :: PDetail -> [CInternalSummand] -> Doc
-ppSummands d cs = sepList (map (nest 2 . ppCon) cs) (t" |")
+ppSummands d cs = sepList (map (nest 2 . ppCon) cs) (t " |")
   where ppCon summand =
             let pp_name = case (cis_names summand) of
                             [cn] -> ppConId d cn
@@ -1253,11 +1280,11 @@ instance PPrint CDef where
 instance PPrint CRule where
         pPrint d p (CRule rps mlbl mqs e) =
                 ppRPS d rps $+$
-                (case mlbl of Nothing -> t""; Just i -> pp d i <> t": ") <> sep [ppQuals d mqs, t "  ==>",
+                (case mlbl of Nothing -> t ""; Just i -> pp d i <> t ": ") <> sep [ppQuals d mqs, t "  ==>",
                 nest 4 (pp d e)]
         pPrint d p (CRuleNest rps mlbl mqs rs) =
                 ppRPS d rps $+$
-                (case mlbl of Nothing -> t""; Just i -> pp d i <> t": ") <>
+                (case mlbl of Nothing -> t ""; Just i -> pp d i <> t ": ") <>
                         (ppQuals d mqs $+$ pBlock d 2 False (map (pp d) rs))
 
 ppRPS :: PDetail -> [RulePragma] -> Doc
@@ -1267,20 +1294,20 @@ ppRPS d rps = vcat (map (pPrint d 0) rps)
 instance PPrint CDefl where
     pPrint d p (CLValueSign def me) = optWhen d me $ pPrint d p def
     pPrint d p (CLValue i cs me) = optWhen d me $
-        foldr1 ($+$) (map (\ cl -> ppClause d p [ppVarId d i] cl <> t";") cs)
+        foldr1 ($+$) (map (\ cl -> ppClause d p [ppVarId d i] cl <> t ";") cs)
     pPrint d p (CLMatch pat e) = ppClause d p [] (CClause [pat] [] e)
 
 optWhen :: PDetail -> [CQual] -> Doc -> Doc
 optWhen d [] s = s
-optWhen d qs s = s $+$ (t"    " <> ppQuals d qs)
+optWhen d qs s = s $+$ (t "    " <> ppQuals d qs)
 
 ppValueSign :: PDetail -> Id -> [TyVar] -> CQType -> [CClause] -> Doc
 ppValueSign d i [] ty cs =
-        (ppVarId d i <+> t "::" <+> pp d ty <> t";") $+$
-        foldr1 ($+$) (map (\ cl -> ppClause d 0 [ppVarId d i] cl <> t";") cs)
+        (ppVarId d i <+> t "::" <+> pp d ty <> t ";") $+$
+        foldr1 ($+$) (map (\ cl -> ppClause d 0 [ppVarId d i] cl <> t ";") cs)
 ppValueSign d i vs ty cs =
-        (ppVarId d i <+> t ":: /\\" <> sep (map (pPrint d maxPrec) vs) <> t"." <> pp d ty <> t";") $+$
-        foldr1 ($+$) (map (\ cl -> ppClause d 0 [ppVarId d i] cl <> t";") cs)
+        (ppVarId d i <+> t ":: /\\" <> sep (map (pPrint d maxPrec) vs) <> t "." <> pp d ty <> t ";") $+$
+        foldr1 ($+$) (map (\ cl -> ppClause d 0 [ppVarId d i] cl <> t ";") cs)
 
 instance PPrint CClause where
     pPrint d p cl = ppClause d p [] cl
@@ -1299,11 +1326,11 @@ instance PPrint CPat where
     pPrint d p (CPCon i as) = pparen (p>(maxPrec-1)) $ sep (ppConId d i : map (pPrint d maxPrec) as)
     pPrint d p (CPstruct _ tyc []) | tyc == idPrimUnit = text "()"
     pPrint d p (CPstruct _ tyc [(_, fst), (_, snd)]) | tyc == idPrimPair =
-        pparen True (pPrint d 0 fst <> t"," <+> pPrint d 0 snd)
-    pPrint d p (CPstruct _ i fs) = pparen (p>(maxPrec-1)) $ ppConId d i <+> t "{" <+> sep (map ppField fs ++ [t"}"])
-        where ppField (i, CPVar i') | i == i' = ppVarId d i <> t";"
-              ppField (i, p) = ppVarId d i <+> t "=" <+> pp d p <> t";"
-    pPrint d p (CPAs a pp) = pPrint d maxPrec a <> t"@" <> pPrint d maxPrec pp
+        pparen True (pPrint d 0 fst <> t "," <+> pPrint d 0 snd)
+    pPrint d p (CPstruct _ i fs) = pparen (p>(maxPrec-1)) $ ppConId d i <+> t "{" <+> sep (map ppField fs ++ [t "}"])
+        where ppField (i, CPVar i') | i == i' = ppVarId d i <> t ";"
+              ppField (i, p) = ppVarId d i <+> t "=" <+> pp d p <> t ";"
+    pPrint d p (CPAs a pp) = pPrint d maxPrec a <> t "@" <> pPrint d maxPrec pp
     pPrint d p (CPAny _) = text "_"
     pPrint d p (CPLit l) = pPrint d p l
     pPrint d p (CPMixedLit _ base ps) =
@@ -1320,7 +1347,7 @@ instance PPrint CPat where
     pPrint d p (CPCon1 _ i a) = pPrint d p (CPCon i [a])
     ----
     pPrint d p (CPConTs _ i ts as) = pparen (p>(maxPrec-1)) $ sep (ppConId d i : map ppApArg ts ++ map (pPrint d maxPrec) as)
-        where ppApArg ty = t"\183" <> pPrint d maxPrec ty
+        where ppApArg ty = t "\183" <> pPrint d maxPrec ty
 
 instance PPrint CPOp where
     pPrint d _ (CPRand p) = pp d p
@@ -1335,12 +1362,12 @@ ppInfix d i =
         b = getIdBase i
     in if (p==fsEmpty) then
               (case getFString b of
-               s@(c:_) | isIdChar c -> t"`" <> t s <> t"`"
+               s@(c:_) | isIdChar c -> t "`" <> t s <> t "`"
                s -> t s)
-        else (t"`" <> t (getFString p) <> t "." <>
+        else (t "`" <> t (getFString p) <> t "." <>
               (case getFString b of
                s@(c:_) | isIdChar c -> t s
-               s -> t "(" <> t s <> t")") <> t"`")
+               s -> t "(" <> t s <> t ")") <> t "`")
 
 instance PPrint CInclude where
     pPrint d p (CInclude s) = pPrint d p s

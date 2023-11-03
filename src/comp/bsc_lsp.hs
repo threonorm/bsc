@@ -94,6 +94,7 @@ import Data.List qualified as L
 import Control.Monad qualified as Monad
 import PPrint qualified as P
 import GHC.Generics (Generic)
+import CSyntax (extractStructTDelf, extractStructTDef)
 
 -- Current limitations: 
 --  1. Errors are at the line level (no multiline errors, no
@@ -107,7 +108,9 @@ import GHC.Generics (Generic)
 --     If we use this the build_dir should be read from the yaml file instead of
 --     passed by the LSP client.
 --  5. TODO: Return the package and the name table as best as possible even if compilation fail (currently returns nothing)
---  6. TODO: Currently points to the type definition for methods, instea dof the module instantiation
+--  6. TODO: Currently points to the type definition for methods, instead of the module instantiation. 
+--     Maybe that should be the behavior for getting the types, but for the definition it should be
+--     The actual definition?
 
 -- TODO: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
@@ -185,24 +188,33 @@ withFilePathFromUri uri k =
         Just s -> k s
         Nothing -> logForClient . toStrict $ format "URI {} cannot be transformed into Filepath" (Only (show uri))
 
+-- getIdStruct :: -> [Id]
+getIdStructs :: CDefn -> [Id]
+getIdStructs x = concat $ case x of
+     CValueSign l ->  (\(CStructT t v) -> fst <$> v) <$> extractStructTDef l 
+     _ -> []
+
 updateNametable :: LSP.Uri -> Maybe (BinMap HeapData) -> Maybe CPackage-> LspState ()
 updateNametable doc maybepackage cpackage =
     Monad.forM_ maybepackage (\m -> do
                         stRef <- lift ask
                         let defs_public_aux = L.map (\(x,y,z,t,u) -> y) $ M.elems m
                             defs_public = L.concatMap (\(CSignature _namePackage _imported _fixity defs) ->
-                                                        L.concatMap definedNames defs) defs_public_aux
+                                                        L.concatMap 
+                                                            -- (\x -> definedNames x ++ getIdStructs x)
+                                                            definedNames
+                                                            defs) defs_public_aux
                             fulldefs_local = fromMaybe [] ((\(CPackage _ _ _ _ defns _) -> defns) <$> cpackage )
                             defs_local = L.concatMap definedNames fulldefs_local 
+                            -- method_local_defs = L.concatMap getIdStructs fulldefs_local
                             all_defs = defs_local ++ defs_public -- Might contain duplicate
                             -- keys_debug = M.keys m
                             -- EDIT: After investigation, the BinMap does not
                             -- contain the toplevel module, we should return all
                             -- this information from the CPackage in the
-                            -- compilation function that's for
-                            -- later 
-
-                        --logForClient . T.pack . show $ keys_debug
+                            -- compilation function that's for later 
+                        -- logForClient . T.pack . show $  L.concatMap (\(CSignature _namePackage _imported _fixity defs) ->
+                                                            -- defs) defs_public_aux
                         -- TODO: Is the following going to create a memory leak? It should get properly GCed double check
                         liftIO . modifyMVar_ stRef $ \x ->
                                                     return $ x{visible_global_identifiers = M.insert
@@ -222,11 +234,14 @@ newtype ServerState = ServerState {
     -- keep the old mapping or delete it? 
     -- Currently leaning toward keeping the old mapping.
     visible_global_identifiers :: M.Map LSP.Uri [Id]
+    -- We are missing the definitions here
 
     -- In the future, this type should carry:
     -- TODO Add documentations 
     -- TODO Add Uri -> NonGlobalDefinitions even for broken files
     -- TODO Add all references to Id? Id -> [(Uri, Position)]
+    -- TODO Type definitions vs value definitions.
+    -- Constructor are type definitions
 }
 
 idAtPos :: LSP.Position -> T.Text -> Maybe (Int, (Int, Int), T.Text)
@@ -254,7 +269,7 @@ isWordChar c = c `elem` ['a'..'z'] || c `elem` ['A'..'Z'] || c `elem` ['0'..'9']
 
 bscPosToLSPPos :: (Int, (Int,Int)) -> Position -> LSP.DefinitionLink
 bscPosToLSPPos (l ,(start,end)) pos = 
-    let line_target =  fromIntegral $ getPositionLine pos
+    let line_target =  fromIntegral $ getPositionLine pos - 1
         range = LSP.Range (LSP.Position line_target 0) (LSP.Position line_target 1000) in
     LSP.DefinitionLink $ LSP.LocationLink 
         (Just . LSP.Range (LSP.Position (fromIntegral l) (fromIntegral start)) $ LSP.Position (fromIntegral l) (fromIntegral end))
@@ -294,8 +309,7 @@ handlers =
             (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack content)) $
                                                 return . diagFromExcep
             diagsForClient doc $ diagErrs ++ diagWarns
-            updateNametable doc maybeNameTable maybePackage
-            )
+            updateNametable doc maybeNameTable maybePackage)
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
         withFilePathFromUri doc (\file -> do
@@ -337,9 +351,8 @@ handlers =
                         Just ids -> do
                             let add_key = (\id -> (getIdBase id, id)) <$> ids
                                 searched = idAtPos pos (VFS.virtualFileText vf)
-                                find_ids = L.nub $ snd <$> L.filter (\(key,v) -> toString key == T.unpack ( (\(x,y,z) -> z) .  fromMaybe (-1, (-1,-1), "_unused_42") $ searched)) add_key
-
-                            logForClient . toStrict $  format "Search {} Several defs {} return the first one" (show searched, show find_ids)
+                                find_ids = snd <$> L.filter (\(key,v) -> toString key == T.unpack ( (\(x,y,z) -> z) .  fromMaybe (-1, (-1,-1), "_unused_42") $ searched)) add_key
+                            -- logForClient . toStrict $ format "Search {} Several defs {} return the first one" (show searched, show find_ids)
                             if null find_ids then 
                                 responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
                             else do
@@ -348,12 +361,28 @@ handlers =
                                 responder . Right $ LSP.InR $ LSP.InL $ bscPosToLSPPos ((\(l,(cs,ce),z)-> (l,(cs,ce))) $ fromJust searched) <$> getIdPosition  <$> (find_ids)
                         Nothing -> responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
+    , requestHandler LSP.SMethod_TextDocumentSignatureHelp $ \req responder -> do
+        let pos = req ^. LSP.params . LSP.position -- pos is a position in the document
+            doc = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
+        withFilePathFromUri doc (\file -> do
+            mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
+            cfg <- getConfig
+            case mdoc of
+              Just vf@(VFS.VirtualFile _ version _rope) -> do
+                    stRef <- lift ask
+                    serverState <- liftIO $ readMVar stRef
+                    return ()
+              Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
 
     -- -- TODO: Investigate if the notion of documentation is understood internally by the BSC compiler
     -- , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
 
     -- -- TODO: I don't know what SetTrace is used for, but vscode keeps sending
     -- those event, so we make a dummy handler.
+    , notificationHandler LSP.SMethod_TextDocumentDidClose $ \msg -> do -- Check what is being written
+        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+        -- TODO: free the data corresponding to the file?
+        return ()
     , notificationHandler LSP.SMethod_SetTrace $ \msg -> do
         return ()
     ]
