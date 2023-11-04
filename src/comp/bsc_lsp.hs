@@ -24,7 +24,8 @@ import System.IO
       utf8 )
 import System.Directory
     ( removeFile,
-      getCurrentDirectory )
+      getCurrentDirectory,
+      createDirectoryIfMissing )
 import Data.Maybe(isJust, catMaybes, fromJust, fromMaybe)
 
 import Control.Monad(when)
@@ -116,7 +117,7 @@ import CSyntax (extractStructTDelf, extractStructTDef)
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
 
 -- TODO: buildDir is currently custom, maybe it should be offset compared to the workspace
-data Config = Config {bscExe :: FilePath, buildDir:: FilePath}
+data Config = Config {bscExe :: FilePath}
   deriving (Generic, J.ToJSON, J.FromJSON, Show)
 
 -- TODO bsv_exe should be provided by the LSP client
@@ -143,8 +144,8 @@ buildDirDefault = "/tmp/build_bsc/"
 
 -- Every options passed to Bluespec except the filename, and [-u] in the case
 -- where we compile recursively
-commandOptions :: Config -> [String]
-commandOptions cfg = ["--aggressive-conditions"] ++ bscExtraArgs ++ ["-p", pathBsvLibs cfg, "-bdir", buildDir cfg]
+commandOptions :: Config -> String -> [String]
+commandOptions cfg builddir = ["--aggressive-conditions"] ++ bscExtraArgs ++ ["-p", pathBsvLibs cfg, "-bdir", builddir]
 
 logForClient :: MonadLsp config f => T.Text -> f ()
 logForClient x = sendNotification LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log x
@@ -222,7 +223,7 @@ updateNametable doc maybepackage cpackage =
 
 type LspState = LspT Config (ReaderT (MVar ServerState) IO)
 
-newtype ServerState = ServerState {
+data ServerState = ServerState {
     -- Currently easy implementation for global identifiers, 
     -- To avoid ambiguities of goto definitions because different
     -- packages could import packages that define the same identifier
@@ -233,7 +234,8 @@ newtype ServerState = ServerState {
     -- TODO: UI question - what to do when file does not compile, should we 
     -- keep the old mapping or delete it? 
     -- Currently leaning toward keeping the old mapping.
-    visible_global_identifiers :: M.Map LSP.Uri [Id]
+    visible_global_identifiers :: M.Map LSP.Uri [Id],
+    buildDir :: FilePath
     -- We are missing the definitions here
 
     -- In the future, this type should carry:
@@ -277,6 +279,12 @@ bscPosToLSPPos (l ,(start,end)) pos =
         range
         range --(LSP.filePathToUri $ getPositionFile pos) _
 
+getWorkspace :: LspState FilePath
+getWorkspace = do 
+            stRef <- lift ask
+            servState <- liftIO $ readMVar stRef 
+            return $ buildDir servState
+
 -- handlers :: Handlers (LspM Config)
 handlers :: Handlers LspState
 handlers =
@@ -284,7 +292,19 @@ handlers =
 --   Add handler for completion
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
         cfg <- getConfig
-        logForClient . toStrict $ format "BSC LSP Server Initialized {} " (Only (show cfg))
+        root <- getRootPath
+        case root of
+         Just root -> do
+            let workspace = root ++ "/.bsclsp"
+            liftIO $ createDirectoryIfMissing True workspace
+            stRef <- lift ask
+            liftIO . modifyMVar_ stRef $ \x -> return $ x{buildDir= workspace}
+            logForClient . toStrict $ format "BSC LSP Server Initialized {} workspace {} " (show cfg, root)
+         Nothing -> do
+            let workspace = "/tmp/.globalbsclsp"
+            liftIO $ createDirectoryIfMissing True workspace
+            stRef <- lift ask
+            liftIO . modifyMVar_ stRef $ \x -> return $ x{buildDir= workspace}
     , notificationHandler LSP.SMethod_WorkspaceDidChangeConfiguration $ \_dummy -> do
         -- See Note about LSP configuration in the haskell lsp package
         return ()
@@ -292,12 +312,13 @@ handlers =
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
             content = msg ^. LSP.params . LSP.textDocument . LSP.text  -- Extract content first time file is opened
         cfg <- getConfig
+        workspace <- getWorkspace
         withFilePathFromUri doc (\file -> do
             -- logForClient . toStrict $ format  "Open File {} " (Only file)
 
             -- First we call the fullblown compiler recursively, to get the [.bo]
             -- files of the submodules and then
-            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg ++ [ "-u", file ]) ""
+            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg workspace ++ [ "-u", file ]) ""
 
             -- Independently of the success of the previous step (technically we
             -- could skip it if the previous step was successful) we call the
@@ -306,33 +327,35 @@ handlers =
             -- importing submodules, typechecking, etc...), an exception is
             -- raised by the compiler.  We catch this exception here  and we
             -- display it as diagnostic
-            (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack content)) $
+            (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg workspace ++ [file])  (T.unpack content)) $
                                                 return . diagFromExcep
             diagsForClient doc $ diagErrs ++ diagWarns
             updateNametable doc maybeNameTable maybePackage)
     , notificationHandler LSP.SMethod_TextDocumentDidChange $ \msg -> do -- VFS automatically contains the content
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+        workspace <- getWorkspace
         withFilePathFromUri doc (\file -> do
             mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
             cfg <- getConfig
             case mdoc of
                 Just vf@(VFS.VirtualFile _ version rope) -> do
-                    (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                    (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg workspace ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                     diagsForClient doc (diagErrs ++ diagWarns)
                     updateNametable doc maybeNameTable maybePackage
                 Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
     , notificationHandler LSP.SMethod_TextDocumentDidSave $ \msg -> do -- Check what is being written
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+        workspace <- getWorkspace
         withFilePathFromUri doc (\file -> do
             mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
             cfg <- getConfig
             case mdoc of
               Just vf@(VFS.VirtualFile _ version _rope) -> do
-                (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg ++ [file]) ""
+                (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg workspace ++ [file]) ""
                 -- Delete stale BO file as the new source is broken 
-                when (errCode /= ExitSuccess) . liftIO $ removeFile (buildDir cfg ++ takeBaseName file ++ ".bo")
-                (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                when (errCode /= ExitSuccess) . liftIO $ removeFile (workspace ++ takeBaseName file ++ ".bo")
+                (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg workspace ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                 diagsForClient doc (diagErrs ++ diagWarns)
                 updateNametable doc maybeNameTable maybePackage
@@ -391,7 +414,7 @@ handlers =
 
 initialServerState :: IO (MVar ServerState)
 initialServerState = do
-    newMVar ServerState{ visible_global_identifiers = M.empty }
+    newMVar ServerState{ visible_global_identifiers = M.empty, buildDir = "/tmp/.globalbsclsp" }
 
 runLSPAndState :: LspState a  -> MVar ServerState -> LanguageContextEnv Config ->  IO a
 runLSPAndState lsp state env = runReaderT (runLspT env lsp) state
@@ -408,8 +431,8 @@ main = do
                                                             J.Success v -> Right v
                                                             J.Error err -> Left $ T.pack err
                          , onConfigChange = const $ pure ()
-                         , defaultConfig = Config {buildDir = buildDirDefault, bscExe = bscExeDefault }
-                         , configSection = "bsclsp" -- TODO investigate what this configSection is suppose to do
+                         , defaultConfig = Config {bscExe = bscExeDefault }
+                         , configSection = "glspc.initializationOptions" -- TODO investigate what this configSection is suppose to do
                          , doInitialize = \env _req -> pure $ Right env
                          , staticHandlers = const handlers
                         --  , interpretHandler = \env -> Iso (runLspT env) liftIO
@@ -482,9 +505,6 @@ compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String -> S
                IO (Bool, BinMap HeapData, HashMap, CPackage)
 compileFile errh flags binmap hashmap name_orig file = do
 
-    handle <- openFile "/tmp/output.txt" AppendMode
-    hPutStr handle "Start Compiling\n"
-    hClose handle
     pwd <- getCurrentDirectory
     let name = (createEncodedFullFilePath name_orig pwd)
 
@@ -496,7 +516,7 @@ compileFile errh flags binmap hashmap name_orig file = do
     t <- getNow
     -- ===== the break point between file manipulation and compilation
     (pkg@(CPackage i _ _ _ _ _), t)
-        <- parseSrc False errh flags True name file
+        <- parseSrc (syntax == CLASSIC) errh flags True name file
 
     let dumpnames = (baseName (dropSuf name), getIdString (unQualId i), "")
     compilePackage errh flags dumpnames t binmap hashmap name pkg
