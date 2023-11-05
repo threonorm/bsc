@@ -20,6 +20,6 @@ endmodule
 
 interface BigFoo;
     interface MyInterface sub;
-    method Bool lol;
+    method Bool lol(TestType a);
 endinterface
 

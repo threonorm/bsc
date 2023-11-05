@@ -2,12 +2,23 @@ import Vector::*;
 import Sidemodule::*;
 
 
-module mkBigInterface(BigFoo);
+module mkBigInterface#(MyInterface yo)(BigFoo);
     let x <- mkMyInterface;
+    Reg#(Bool) to <- mkReg(True);
+
+    let foo = False; 
+    foo = True; 
+
+    rule yoyo if (to);
+        to <= foo;
+        yo.foo();
+    endrule
 
     interface MyInterface sub = x;
 
-    method Bool lol(); 
-        return (x.bar(?) == 0);
+    method Bool lol(TestType a); 
+        Bool bar = True;
+        bar = (x.bar(?) == a);
+        return bar;
     endmethod
 endmodule

@@ -28,6 +28,7 @@ import System.Directory
       createDirectoryIfMissing )
 import Data.Maybe(isJust, catMaybes, fromJust, fromMaybe)
 
+import PreStrings(fsEmpty)
 import Control.Monad(when)
 import qualified Data.Map as M
 
@@ -59,7 +60,8 @@ import Error(ErrorHandle, ExcepWarnErr(..),
 import Position(Position (..),
         getPositionLine,
         getPositionFile,
-        getPositionColumn)
+        getPositionColumn,
+        mkPosition)
 import CVPrint
 import Id
 import Deriving(derive)
@@ -97,6 +99,7 @@ import PPrint qualified as P
 import GHC.Generics (Generic)
 import CSyntax (extractStructTDelf, extractStructTDef)
 import qualified PFPrint as Pp
+import Data.Aeson.Types (parse)
 
 -- Current limitations: 
 --  1. Errors are at the line level (no multiline errors, no
@@ -114,92 +117,78 @@ import qualified PFPrint as Pp
 --     quite useful? -> Call the frontend for the subfile to find the position
 --     of the method
 
--- Find all variables named "sthg"
--- Generate the proper datastructure
 
--- Task1: For any id, find all the ids that precedes it in the file that are writing
+-- Strawman to get some number of local definitions manually
+-- TODO get more, right now we only gather some local module instances and
+-- module parameters We don't go down in rules as it is painful to find
 
 isSameIdBefore :: Id -> Id -> Bool
 isSameIdBefore current target = 
-    undefined
+    current == target && getPositionLine (getIdPosition current) <= getPositionLine (getIdPosition target)
 
-pruneLocalCDefn :: CDefn -> Id -> Maybe CDefn
-pruneLocalCDefn cdefn pos =
+
+getPreviousPosFromParsedPackage :: Id -> CPackage -> [Id]
+getPreviousPosFromParsedPackage pos (CPackage _ _ _ _ defns _) = 
+    -- TODO limitation currently will potentially return unrelated definitions in previous
+    -- modules of the package, we should only keep the defns which contains the pos
+    -- TODO to make that easier it would be good to write a function
+    -- that returns the (minpos, maxpos) in an arbitrary piece of CSyntax
+    concatMap (pruneLocalCDefn pos) defns
+
+pruneLocalCDefn :: Id -> CDefn  -> [Id]
+pruneLocalCDefn pos cdefn =
     case cdefn of
-        CValue id cclauses ->
-            case catMaybes $ (`pruneLocalCClause` pos) <$> cclauses of 
-                [] -> if isSameIdBefore id pos  then Just $ CValue id [] else Nothing
-                l -> Just $  CValue id l 
         CValueSign cdef ->
-            case pruneLocalCDef cdef pos of
-                Just x -> Just $ CValueSign x
-                _ -> Nothing
-        Cinstance cqtype cdelfs ->
-            case catMaybes $ (`pruneLocalCDefl` pos) <$> cdelfs of 
-                [] -> Nothing
-                l -> Just $ Cinstance cqtype l 
-        _ -> Nothing
+             pruneLocalCDef pos  cdef 
+        _ -> [] 
+      
 
-pruneLocalCDefl :: CDefl -> Id -> Maybe CDefl
-pruneLocalCDefl cdefn pos =
-    case cdefn of
-        CLValueSign cdef cquals -> undefined
-        CLValue id cclauses cquals -> undefined
-        CLMatch cpat cexpr -> undefined
-
-pruneLocalCDef :: CDef -> Id -> Maybe CDef
-pruneLocalCDef cdefn pos =
-    case cdefn of
+pruneLocalCDef :: Id -> CDef -> [Id]
+pruneLocalCDef pos cdef =
+    case cdef of
         CDef id cqtype cclauses -> 
-            case catMaybes $ (`pruneLocalCClause` pos) <$> cclauses of 
-                [] -> if isSameIdBefore id pos  then Just $ CDef id cqtype [] else Nothing
-                l -> Just $  CDef id cqtype l 
-        CDefT id tyvars cqType cclauses -> 
-            case catMaybes $ (`pruneLocalCClause` pos) <$> cclauses of 
-                [] -> if isSameIdBefore id pos  then Just $ CDefT id tyvars cqType [] else Nothing
-                l -> Just $  CDefT id tyvars cqType l 
+            --  let new = if isSameIdBefore id pos then [id] else [] in 
+            --  new ++ 
+            concatMap (pruneLocalCClause pos) cclauses
+        _ -> [] 
 
-pruneLocalCClause :: CClause -> Id -> Maybe CClause
-pruneLocalCClause cdefn pos =
-    undefined
-pruneLocalCExpr :: CExpr -> Id -> Maybe CExpr 
-pruneLocalCExpr cexpr id =  
+pruneLocalCClause :: Id -> CClause -> [ Id ]
+pruneLocalCClause pos cdefn =
+    case cdefn of 
+        CClause args _ c -> 
+            getIdEqualArgs pos args ++ pruneLocalCExpr pos c
+
+getIdEqualArgs :: Id -> [CPat] -> [Id]
+getIdEqualArgs pos [] = []
+getIdEqualArgs pos ((CPVar x):tl) = ( if x `isSameIdBefore` pos then [x] else [] ) ++ (getIdEqualArgs pos tl)
+getIdEqualArgs pos (_:tl) = (getIdEqualArgs pos tl)
+
+
+pruneLocalCMStmt :: Id -> CMStmt -> [Id]
+pruneLocalCMStmt pos stmt = 
+    case stmt of 
+        CMStmt s -> pruneLocalCStmt pos s 
+        _ -> []
+
+
+-- Minimum syndical - try to find just the definitions of instances in modules
+pruneLocalCStmt :: Id -> CStmt -> [Id]
+pruneLocalCStmt pos stmt = 
+    case stmt of 
+        CSBindT (CPVar x) _ _ t rhs -> if x `isSameIdBefore` pos then [x] else []
+        CSBind (CPVar x) _ _ rhs -> if x `isSameIdBefore` pos then [x] else []
+        CSletseq [CLValue x cclauses _] -> if x `isSameIdBefore` pos then [x] else []
+        _ -> []
+
+
+
+pruneLocalCExpr :: Id -> CExpr -> [Id]
+pruneLocalCExpr pos cexpr  =  
     case cexpr of 
-        CVar cur -> if cur `isSameIdBefore` id then Just $ cexpr else Nothing
-        CSubUpdate pos cexpr (l,r) n -> 
-            pruneLocalCExpr cexpr id
-        CHasType cexpr l -> 
-            pruneLocalCExpr cexpr id 
-        CStructUpd cexpr _ ->
-            pruneLocalCExpr cexpr id 
-        Cif pos cond t f -> 
-            case (pruneLocalCExpr t id, pruneLocalCExpr f id) of 
-                (Just x, Just y) -> Just $ Cif pos cond x y
-                (Just x, _) -> Just x 
-                (_ , Just y) -> Just y 
-                (Nothing, Nothing) -> Nothing
-        Cletseq cdefls cexpr -> undefined
-        Cletrec  cdefls cexpr -> undefined
-        --  -- Implementation  of other constructors for CSyntax does not seem necessary
-        -- Cinterface x (Just cur) cdefls ->
-        --     case catMaybes $ (`pruneLocalCDefl` id) <$> cdefls of 
-        --         [] -> if isSameIdBefore cur id  then Just $ Cinterface x (Just cur) [] else Nothing
-        --         l -> Just $  Cinterface  x (Just cur) l 
-        -- Cinterface x Nothing cdefls ->
-        --     case catMaybes $ (`pruneLocalCDefl` id) <$> cdefls of 
-        --         [] -> Nothing
-        --         l -> Just $  Cinterface  x Nothing l 
-        -- Cmodule _ cmstmts -> undefined
-        -- Caction Position CStmts -- What are actions in bsv? 
-        -- Crules [CSchedulePragma] [CRule]
-        -- CAny Position UndefKind
-        -- Cdo Bool CStmts        -- Don't support do for now
-        -- CLam (Either Position Id) CExpr  -- We can only handle the case right?
-        -- CLamT (Either Position Id) CQType CExpr -- We can only handle the case right?
-       
+        Cmodule _ cmstmts -> concatMap (pruneLocalCMStmt pos) cmstmts 
+        _ -> []
 
--- cdefAtPos :: Pos -> CDefn
--- localDefs :: Pos -> CDefn -> [Id]
+
 
 -- TODO EASY: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
@@ -284,7 +273,10 @@ getIdStructs x = concat $ case x of
 
 updateNametable :: LSP.Uri -> Maybe (BinMap HeapData) -> Maybe CPackage-> LspState ()
 updateNametable doc maybepackage cpackage =
-    Monad.forM_ maybepackage (\m -> do
+    -- This function sssumes that if [maybepackage] is Nothing, then [cpackage]
+    -- is also Nothing (Both datastructure should be Nothing simultaneously)
+    Monad.forM_ cpackage (\c -> 
+        Monad.forM_ maybepackage (\m -> do
                         stRef <- lift ask
                         let defs_public_aux = L.map (\(x,y,z,t,u) -> y) $ M.elems m
                             defs_public = L.concatMap (\(CSignature _namePackage _imported _fixity defs) ->
@@ -292,23 +284,15 @@ updateNametable doc maybepackage cpackage =
                                                             -- (\x -> definedNames x ++ getIdStructs x)
                                                             definedNames
                                                             defs) defs_public_aux
-                            fulldefs_local = fromMaybe [] ((\(CPackage _ _ _ _ defns _) -> defns) <$> cpackage )
-                            defs_local = L.concatMap definedNames fulldefs_local
+                            -- fulldefs_local = fromMaybe [] ((\(CPackage _ _ _ _ defns _) -> defns) <$> cpackage )
+                            -- defs_local = L.concatMap definedNames fulldefs_local
                             -- method_local_defs = L.concatMap getIdStructs fulldefs_local
-                            all_defs = defs_local ++ defs_public -- Might contain duplicate
-                            -- keys_debug = M.keys m
-                            -- EDIT: After investigation, the BinMap does not
-                            -- contain the toplevel module, we should return all
-                            -- this information from the CPackage in the
-                            -- compilation function that's for later 
-                        logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> show defns) cpackage
-                        logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> Pp.pp80 defns) cpackage
-                        -- (\(CSignature _namePackage _imported _fixity defs) ->
-                        --                                     P.pp80 defs) defs_public_aux
-                        -- TODO: Is the following going to create a memory leak? It should get properly GCed double check
+                            all_defs = defs_public -- Might contain duplicate
+                        -- logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> Pp.pp80 defns) cpackage
                         liftIO . modifyMVar_ stRef $ \x ->
                                                     return $ x{visible_global_identifiers = M.insert
-                                                                    doc all_defs (visible_global_identifiers x)})
+                                                                    doc all_defs (visible_global_identifiers x),
+                                                                parsedByUri = M.insert doc c (parsedByUri x)}))
 
 type LspState = LspT Config (ReaderT (MVar ServerState) IO)
 
@@ -325,6 +309,7 @@ data ServerState = ServerState {
     -- Currently leaning toward keeping the old mapping.
     visible_global_identifiers :: M.Map LSP.Uri [Id],
     typeId :: M.Map LSP.Uri (M.Map Id Id),
+    parsedByUri :: M.Map LSP.Uri CPackage,
     buildDir :: FilePath
     -- We are missing the definitions here
 
@@ -464,15 +449,14 @@ handlers =
                         Just ids -> do
                             let add_key = (\id -> (getIdBase id, id)) <$> ids
                                 searched = idAtPos pos (VFS.virtualFileText vf)
-                                find_ids = snd <$> L.filter (\(key,v) -> toString key == T.unpack ( (\(x,y,z) -> z) .  fromMaybe (-1, (-1,-1), "_unused_42") $ searched)) add_key
-                            -- logForClient . toStrict $ format "Search {} Several defs {} return the first one" (show searched, show find_ids)
-                            if null find_ids then
-                                responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
-                            else do
-                                when (length find_ids /= 1) .
-                                    logForClient . toStrict $  format "Several defs {} return the first one" (Only $ show find_ids)
-                                responder . Right $ LSP.InR $ LSP.InL $ bscPosToLSPPos ((\(l,(cs,ce),z)-> (l,(cs,ce))) $ fromJust searched) <$> getIdPosition  <$> (find_ids)
-                        Nothing -> responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
+                                (line, (colbegin,colend), idname) = fromMaybe (-1, (-1,-1), "_unused_42") $ searched
+                                find_ids_glob = snd <$> L.filter (\(key,v) -> toString key == T.unpack idname) add_key
+                                find_ids_local = getPreviousPosFromParsedPackage (mkId (mkPosition fsEmpty line colbegin ) .  fromString $ T.unpack idname) . 
+                                                    fromMaybe (CPackage undefined undefined undefined undefined [] undefined) $ M.lookup doc $ parsedByUri serverState
+                                find_ids = find_ids_local ++ find_ids_glob 
+                            responder . Right $ LSP.InR $ LSP.InL $ bscPosToLSPPos ((\(l,(cs,ce),z)-> (l,(cs,ce))) $ fromJust searched) <$> getIdPosition  <$> find_ids
+                        Nothing ->
+                            responder . Right $ LSP.InR $ LSP.InL []
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
     , requestHandler LSP.SMethod_TextDocumentSignatureHelp $ \req responder -> do
         let pos = req ^. LSP.params . LSP.position -- pos is a position in the document
@@ -504,7 +488,7 @@ handlers =
 
 initialServerState :: IO (MVar ServerState)
 initialServerState = do
-    newMVar ServerState{ visible_global_identifiers = M.empty, buildDir = "/tmp/.globalbsclsp", typeId = M.empty }
+    newMVar ServerState{ visible_global_identifiers = M.empty, buildDir = "/tmp/.globalbsclsp", typeId = M.empty, parsedByUri = M.empty }
 
 runLSPAndState :: LspState a  -> MVar ServerState -> LanguageContextEnv Config ->  IO a
 runLSPAndState lsp state env = runReaderT (runLspT env lsp) state
