@@ -740,10 +740,10 @@ definedNames (Cprimitive i _) = [i]
 definedNames (CprimType i) = [iKName i]
 definedNames (CPragma pr) = []
 definedNames (Cforeign { cforg_name = i }) = [i]
-definedNames (Ctype i _ t) = [iKName i] ++ namedCons t
+definedNames (Ctype i _ t) = [iKName i] -- ++ namedCons t
 definedNames (Cdata { cd_name = name }) = [iKName name]
-definedNames (Cstruct _ _ i _ f _) = [iKName i] ++ (cf_name  <$> f)
-definedNames (Cclass _ _ i _ _ f) = [iKName i]  ++ (cf_name <$> f)
+definedNames (Cstruct _ _ i _ f _) = [iKName i] -- ++ (cf_name  <$> f)
+definedNames (Cclass _ _ i _ _ f) = [iKName i]  -- ++ (cf_name <$> f)
 definedNames (Cinstance qt _) = []
 definedNames (CItype i _ _) = [iKName i]
 definedNames (CIclass _ _ i _ _ _) = [iKName i]

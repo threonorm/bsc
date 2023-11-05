@@ -102,21 +102,50 @@ import CSyntax (extractStructTDelf, extractStructTDef)
 --  end of column error).
 --  2. bsc_lsp is singlethreaded
 --  3. No support for project yaml file
---  4. Currently every BO file is in a folder specified by the LSP client (so
---     global for all project right now). Maybe we should instead use the
---     project compilation folder though it may be dangerous to share BO files
---     (there could be macro stuff for example, how should we deal with that?).
---     If we use this the build_dir should be read from the yaml file instead of
---     passed by the LSP client.
---  5. TODO: Return the package and the name table as best as possible even if compilation fail (currently returns nothing)
---  6. TODO: Currently points to the type definition for methods, instead of the module instantiation. 
+--  4. TODO: Return the package and the name table as best as possible even if compilation fail (currently returns nothing)
+--  5. TODO: Currently points to the type definition for methods, instead of the module instantiation. 
 --     Maybe that should be the behavior for getting the types, but for the definition it should be
 --     The actual definition?
+--  6. How to get local definitions?
+--  7. Go to [instance.subinterface1.subsub.method]  in general this is very
+--     difficult. Already instance.method() is tricky as we would need to know
+--     the line where method is defined -> Maybe special case it as it would be
+--     quite useful? -> Call the frontend for the subfile to find the position
+--     of the method
 
--- TODO: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
+-- Find all variables named "sthg"
+-- Generate the proper datastructure
+
+-- Task1: For any position, generate a CDefn that corresponds to the parent to 
+-- the prefix up to that point
+
+pruneLocalCDefn :: CDefn -> Position -> Maybe CDefn
+pruneLocalCDefn cdefn pos = 
+    case cdefn of 
+        CValue id cclauses -> Just $  CValue id cclauses
+        CValueSign cdef -> Just $  CValueSign cdef
+        Cinstance cqtype cdelfs -> Just $ Cinstance cqtype cdelfs
+        _ -> Nothing 
+
+pruneLocalCDefl :: CDefl -> Position -> Maybe CDefl
+pruneLocalCDefl cdefn pos = 
+    case cdefn of 
+        CLValueSign cdef cquals -> undefined
+        CLValue id cclauses cquals -> undefined
+        CLMatch cpat cexpr -> undefined
+
+pruneLocalCDef :: CDef -> Position -> Maybe CDef
+pruneLocalCDef cdefn pos = 
+    case cdefn of  
+        CDef id cqtype cclauses -> undefined
+        CDefT id tyvars cqType cclauses -> undefined 
+
+-- cdefAtPos :: Pos -> CDefn
+-- localDefs :: Pos -> CDefn -> [Id]
+
+-- TODO EASY: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
 
--- TODO: buildDir is currently custom, maybe it should be offset compared to the workspace
 data Config = Config {bscExe :: FilePath}
   deriving (Generic, J.ToJSON, J.FromJSON, Show)
 
@@ -214,8 +243,9 @@ updateNametable doc maybepackage cpackage =
                             -- contain the toplevel module, we should return all
                             -- this information from the CPackage in the
                             -- compilation function that's for later 
-                        -- logForClient . T.pack . show $  L.concatMap (\(CSignature _namePackage _imported _fixity defs) ->
-                                                            -- defs) defs_public_aux
+                        logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> P.pp80 defns) cpackage
+                        -- (\(CSignature _namePackage _imported _fixity defs) ->
+                        --                                     P.pp80 defs) defs_public_aux
                         -- TODO: Is the following going to create a memory leak? It should get properly GCed double check
                         liftIO . modifyMVar_ stRef $ \x ->
                                                     return $ x{visible_global_identifiers = M.insert
@@ -235,6 +265,7 @@ data ServerState = ServerState {
     -- keep the old mapping or delete it? 
     -- Currently leaning toward keeping the old mapping.
     visible_global_identifiers :: M.Map LSP.Uri [Id],
+    typeId :: M.Map LSP.Uri (M.Map Id Id),
     buildDir :: FilePath
     -- We are missing the definitions here
 
@@ -400,7 +431,7 @@ handlers =
     -- -- TODO: Investigate if the notion of documentation is understood internally by the BSC compiler
     -- , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
 
-    -- -- TODO: I don't know what SetTrace is used for, but vscode keeps sending
+    -- -- TODO: Don't know what SetTrace is used for, but vscode keeps sending
     -- those event, so we make a dummy handler.
     , notificationHandler LSP.SMethod_TextDocumentDidClose $ \msg -> do -- Check what is being written
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
@@ -414,7 +445,7 @@ handlers =
 
 initialServerState :: IO (MVar ServerState)
 initialServerState = do
-    newMVar ServerState{ visible_global_identifiers = M.empty, buildDir = "/tmp/.globalbsclsp" }
+    newMVar ServerState{ visible_global_identifiers = M.empty, buildDir = "/tmp/.globalbsclsp", typeId = M.empty }
 
 runLSPAndState :: LspState a  -> MVar ServerState -> LanguageContextEnv Config ->  IO a
 runLSPAndState lsp state env = runReaderT (runLspT env lsp) state
