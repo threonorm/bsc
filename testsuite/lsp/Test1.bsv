@@ -2,7 +2,6 @@ import Vector::*;
 import Sidemodule::*;
 
 
-
 module mkBigInterface(BigFoo);
     let x <- mkMyInterface;
 

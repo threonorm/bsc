@@ -56,7 +56,7 @@ import Error(ErrorHandle, ExcepWarnErr(..),
              prEMsg, swarning, serror,
              initErrorHandle, setErrorHandleFlags,
              extractPosition,  bsWarning)
-import Position(Position (..), 
+import Position(Position (..),
         getPositionLine,
         getPositionFile,
         getPositionColumn)
@@ -96,6 +96,7 @@ import Control.Monad qualified as Monad
 import PPrint qualified as P
 import GHC.Generics (Generic)
 import CSyntax (extractStructTDelf, extractStructTDef)
+import qualified PFPrint as Pp
 
 -- Current limitations: 
 --  1. Errors are at the line level (no multiline errors, no
@@ -116,29 +117,86 @@ import CSyntax (extractStructTDelf, extractStructTDef)
 -- Find all variables named "sthg"
 -- Generate the proper datastructure
 
--- Task1: For any position, generate a CDefn that corresponds to the parent to 
--- the prefix up to that point
+-- Task1: For any id, find all the ids that precedes it in the file that are writing
 
-pruneLocalCDefn :: CDefn -> Position -> Maybe CDefn
-pruneLocalCDefn cdefn pos = 
-    case cdefn of 
-        CValue id cclauses -> Just $  CValue id cclauses
-        CValueSign cdef -> Just $  CValueSign cdef
-        Cinstance cqtype cdelfs -> Just $ Cinstance cqtype cdelfs
-        _ -> Nothing 
+isSameIdBefore :: Id -> Id -> Bool
+isSameIdBefore current target = 
+    undefined
 
-pruneLocalCDefl :: CDefl -> Position -> Maybe CDefl
-pruneLocalCDefl cdefn pos = 
-    case cdefn of 
+pruneLocalCDefn :: CDefn -> Id -> Maybe CDefn
+pruneLocalCDefn cdefn pos =
+    case cdefn of
+        CValue id cclauses ->
+            case catMaybes $ (`pruneLocalCClause` pos) <$> cclauses of 
+                [] -> if isSameIdBefore id pos  then Just $ CValue id [] else Nothing
+                l -> Just $  CValue id l 
+        CValueSign cdef ->
+            case pruneLocalCDef cdef pos of
+                Just x -> Just $ CValueSign x
+                _ -> Nothing
+        Cinstance cqtype cdelfs ->
+            case catMaybes $ (`pruneLocalCDefl` pos) <$> cdelfs of 
+                [] -> Nothing
+                l -> Just $ Cinstance cqtype l 
+        _ -> Nothing
+
+pruneLocalCDefl :: CDefl -> Id -> Maybe CDefl
+pruneLocalCDefl cdefn pos =
+    case cdefn of
         CLValueSign cdef cquals -> undefined
         CLValue id cclauses cquals -> undefined
         CLMatch cpat cexpr -> undefined
 
-pruneLocalCDef :: CDef -> Position -> Maybe CDef
-pruneLocalCDef cdefn pos = 
-    case cdefn of  
-        CDef id cqtype cclauses -> undefined
-        CDefT id tyvars cqType cclauses -> undefined 
+pruneLocalCDef :: CDef -> Id -> Maybe CDef
+pruneLocalCDef cdefn pos =
+    case cdefn of
+        CDef id cqtype cclauses -> 
+            case catMaybes $ (`pruneLocalCClause` pos) <$> cclauses of 
+                [] -> if isSameIdBefore id pos  then Just $ CDef id cqtype [] else Nothing
+                l -> Just $  CDef id cqtype l 
+        CDefT id tyvars cqType cclauses -> 
+            case catMaybes $ (`pruneLocalCClause` pos) <$> cclauses of 
+                [] -> if isSameIdBefore id pos  then Just $ CDefT id tyvars cqType [] else Nothing
+                l -> Just $  CDefT id tyvars cqType l 
+
+pruneLocalCClause :: CClause -> Id -> Maybe CClause
+pruneLocalCClause cdefn pos =
+    undefined
+pruneLocalCExpr :: CExpr -> Id -> Maybe CExpr 
+pruneLocalCExpr cexpr id =  
+    case cexpr of 
+        CVar cur -> if cur `isSameIdBefore` id then Just $ cexpr else Nothing
+        CSubUpdate pos cexpr (l,r) n -> 
+            pruneLocalCExpr cexpr id
+        CHasType cexpr l -> 
+            pruneLocalCExpr cexpr id 
+        CStructUpd cexpr _ ->
+            pruneLocalCExpr cexpr id 
+        Cif pos cond t f -> 
+            case (pruneLocalCExpr t id, pruneLocalCExpr f id) of 
+                (Just x, Just y) -> Just $ Cif pos cond x y
+                (Just x, _) -> Just x 
+                (_ , Just y) -> Just y 
+                (Nothing, Nothing) -> Nothing
+        Cletseq cdefls cexpr -> undefined
+        Cletrec  cdefls cexpr -> undefined
+        --  -- Implementation  of other constructors for CSyntax does not seem necessary
+        -- Cinterface x (Just cur) cdefls ->
+        --     case catMaybes $ (`pruneLocalCDefl` id) <$> cdefls of 
+        --         [] -> if isSameIdBefore cur id  then Just $ Cinterface x (Just cur) [] else Nothing
+        --         l -> Just $  Cinterface  x (Just cur) l 
+        -- Cinterface x Nothing cdefls ->
+        --     case catMaybes $ (`pruneLocalCDefl` id) <$> cdefls of 
+        --         [] -> Nothing
+        --         l -> Just $  Cinterface  x Nothing l 
+        -- Cmodule _ cmstmts -> undefined
+        -- Caction Position CStmts -- What are actions in bsv? 
+        -- Crules [CSchedulePragma] [CRule]
+        -- CAny Position UndefKind
+        -- Cdo Bool CStmts        -- Don't support do for now
+        -- CLam (Either Position Id) CExpr  -- We can only handle the case right?
+        -- CLamT (Either Position Id) CQType CExpr -- We can only handle the case right?
+       
 
 -- cdefAtPos :: Pos -> CDefn
 -- localDefs :: Pos -> CDefn -> [Id]
@@ -209,8 +267,8 @@ diagFromExcep (ExcepWarnErr err warn ctxt) = do
                                     Nothing Nothing Nothing) warn
     (diag, diagw, Nothing, Nothing)
 
-emptyDiags :: (Bool, c, p) -> ([LSP.Diagnostic], [LSP.Diagnostic], Maybe c, Maybe p)
-emptyDiags (_,map, package) = ([],[], Just map, Just package)
+emptyDiags :: (Bool, c, p, p) -> ([LSP.Diagnostic], [LSP.Diagnostic], Maybe c, Maybe p)
+emptyDiags (_,map, packagetc, package) = ([],[], Just map, Just package)
 
 withFilePathFromUri :: MonadLsp config f => LSP.Uri -> (FilePath -> f ()) -> f ()
 withFilePathFromUri uri k =
@@ -221,7 +279,7 @@ withFilePathFromUri uri k =
 -- getIdStruct :: -> [Id]
 getIdStructs :: CDefn -> [Id]
 getIdStructs x = concat $ case x of
-     CValueSign l ->  (\(CStructT t v) -> fst <$> v) <$> extractStructTDef l 
+     CValueSign l ->  (\(CStructT t v) -> fst <$> v) <$> extractStructTDef l
      _ -> []
 
 updateNametable :: LSP.Uri -> Maybe (BinMap HeapData) -> Maybe CPackage-> LspState ()
@@ -230,12 +288,12 @@ updateNametable doc maybepackage cpackage =
                         stRef <- lift ask
                         let defs_public_aux = L.map (\(x,y,z,t,u) -> y) $ M.elems m
                             defs_public = L.concatMap (\(CSignature _namePackage _imported _fixity defs) ->
-                                                        L.concatMap 
+                                                        L.concatMap
                                                             -- (\x -> definedNames x ++ getIdStructs x)
                                                             definedNames
                                                             defs) defs_public_aux
                             fulldefs_local = fromMaybe [] ((\(CPackage _ _ _ _ defns _) -> defns) <$> cpackage )
-                            defs_local = L.concatMap definedNames fulldefs_local 
+                            defs_local = L.concatMap definedNames fulldefs_local
                             -- method_local_defs = L.concatMap getIdStructs fulldefs_local
                             all_defs = defs_local ++ defs_public -- Might contain duplicate
                             -- keys_debug = M.keys m
@@ -243,7 +301,8 @@ updateNametable doc maybepackage cpackage =
                             -- contain the toplevel module, we should return all
                             -- this information from the CPackage in the
                             -- compilation function that's for later 
-                        logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> P.pp80 defns) cpackage
+                        logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> show defns) cpackage
+                        logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> Pp.pp80 defns) cpackage
                         -- (\(CSignature _namePackage _imported _fixity defs) ->
                         --                                     P.pp80 defs) defs_public_aux
                         -- TODO: Is the following going to create a memory leak? It should get properly GCed double check
@@ -280,7 +339,7 @@ data ServerState = ServerState {
 idAtPos :: LSP.Position -> T.Text -> Maybe (Int, (Int, Int), T.Text)
 idAtPos pos text =
     -- the id is necessarily on a single line first extract the line
-    let line_n :: Int = fromIntegral $ pos ^. LSP.line 
+    let line_n :: Int = fromIntegral $ pos ^. LSP.line
         column_n :: Int = fromIntegral $ pos ^. LSP.character
         line = T.lines text L.!! line_n in
     (\(x,y,z) -> (line_n, (x,y), z)) <$> extractWordAroundPosition column_n line
@@ -294,26 +353,26 @@ findWordBoundaries :: Int -> T.Text -> Maybe (Int, Int)
 findWordBoundaries position text = do
     let (before, after) = T.splitAt position text
     let start = T.length (T.takeWhile isWordChar (T.reverse before))
-    let end = T.length (T.takeWhile isWordChar after) + position 
+    let end = T.length (T.takeWhile isWordChar after) + position
     return (position - start, end)
 
 isWordChar :: Char -> Bool
 isWordChar c = c `elem` ['a'..'z'] || c `elem` ['A'..'Z'] || c `elem` ['0'..'9']
 
 bscPosToLSPPos :: (Int, (Int,Int)) -> Position -> LSP.DefinitionLink
-bscPosToLSPPos (l ,(start,end)) pos = 
+bscPosToLSPPos (l ,(start,end)) pos =
     let line_target =  fromIntegral $ getPositionLine pos - 1
         range = LSP.Range (LSP.Position line_target 0) (LSP.Position line_target 1000) in
-    LSP.DefinitionLink $ LSP.LocationLink 
+    LSP.DefinitionLink $ LSP.LocationLink
         (Just . LSP.Range (LSP.Position (fromIntegral l) (fromIntegral start)) $ LSP.Position (fromIntegral l) (fromIntegral end))
-        (LSP.filePathToUri $ getPositionFile pos) 
+        (LSP.filePathToUri $ getPositionFile pos)
         range
         range --(LSP.filePathToUri $ getPositionFile pos) _
 
 getWorkspace :: LspState FilePath
-getWorkspace = do 
+getWorkspace = do
             stRef <- lift ask
-            servState <- liftIO $ readMVar stRef 
+            servState <- liftIO $ readMVar stRef
             return $ buildDir servState
 
 -- handlers :: Handlers (LspM Config)
@@ -407,7 +466,7 @@ handlers =
                                 searched = idAtPos pos (VFS.virtualFileText vf)
                                 find_ids = snd <$> L.filter (\(key,v) -> toString key == T.unpack ( (\(x,y,z) -> z) .  fromMaybe (-1, (-1,-1), "_unused_42") $ searched)) add_key
                             -- logForClient . toStrict $ format "Search {} Several defs {} return the first one" (show searched, show find_ids)
-                            if null find_ids then 
+                            if null find_ids then
                                 responder . Left $ LSP.ResponseError (LSP.InR LSP.ErrorCodes_MethodNotFound) "No data for current file" Nothing
                             else do
                                 when (length find_ids /= 1) .
@@ -483,7 +542,7 @@ main = do
 
 -- Use with hugs top level
 -- hmain :: [String] -> String -> IO Bool
-hmain :: [String] -> String -> IO (Bool, BinMap HeapData, CPackage)
+hmain :: [String] -> String -> IO (Bool, BinMap HeapData, CPackage, CPackage)
 hmain args contentFile = do
     pprog <- getProgName
     cdir <- getEnvDef "BLUESPECDIR" dfltBluespecDir
@@ -512,7 +571,7 @@ hmain args contentFile = do
 
 
 -- main' :: ErrorHandle -> Flags -> String -> String -> IO Bool
-main' :: ErrorHandle -> Flags -> String -> String -> IO (Bool, BinMap HeapData, CPackage)
+main' :: ErrorHandle -> Flags -> String -> String -> IO (Bool, BinMap HeapData, CPackage, CPackage)
 main' errh flags name contentFile =  do
     setErrorHandleFlags errh flags
     tStart <- getNow
@@ -526,14 +585,14 @@ main' errh flags name contentFile =  do
 
 
 -- compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO Bool
-compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO (Bool, BinMap HeapData, CPackage)
+compile_no_deps :: ErrorHandle -> Flags -> String -> String -> IO (Bool, BinMap HeapData, CPackage, CPackage)
 compile_no_deps errh flags name contentFile = do
-  (ok, loaded, _, cpackage) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
-  return (ok, loaded, cpackage)
+  (ok, loaded, _, cpackage, parsed) <- compileFile errh flags M.empty M.empty name contentFile -- Pass the string that contains the thing to tc
+  return (ok, loaded, cpackage, parsed)
 
 -- returns whether the compile errored or not
 compileFile :: ErrorHandle -> Flags -> BinMap HeapData -> HashMap -> String -> String ->
-               IO (Bool, BinMap HeapData, HashMap, CPackage)
+               IO (Bool, BinMap HeapData, HashMap, CPackage, CPackage)
 compileFile errh flags binmap hashmap name_orig file = do
 
     pwd <- getCurrentDirectory
@@ -563,7 +622,7 @@ compilePackage ::
     HashMap ->
     String ->
     CPackage ->
-    IO (Bool, BinMap HeapData, HashMap, CPackage)
+    IO (Bool, BinMap HeapData, HashMap, CPackage, CPackage)
 compilePackage
     errh
     flags                -- user switches
@@ -673,7 +732,7 @@ compilePackage
 
     --putStr (ppReadable mod)
     t <- dump errh flags t DFtypecheck dumpnames mod
-    return ( not tcErrors, binmap, hashmap, mod)
+    return ( not tcErrors, binmap, hashmap, mod, min)
 
 
 -- Our server should compile subpackets
