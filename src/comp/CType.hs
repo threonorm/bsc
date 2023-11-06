@@ -158,17 +158,17 @@ data PartialKind
         | PKNum
         | PKStr
         | PKfun PartialKind PartialKind
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, Generic.Data, Generic.Typeable)
 
 -- | A named typeclass
 newtype CTypeclass = CTypeclass Id
-    deriving (Eq, Ord, Show, PPrint, HasPosition, Hyper)
+    deriving (Eq, Ord, Show, PPrint, HasPosition, Hyper, Generic.Data, Generic.Typeable)
 
 -- | Representation of the provisos and other class constraints
 data CPred = CPred { cpred_tc   :: CTypeclass  -- ^ constraint class, e.g., "Eq"
                    , cpred_args :: [CType]     -- ^ argument types
                    }
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, Generic.Data, Generic.Typeable)
 
 -- Eq instances
 
@@ -293,7 +293,7 @@ instance HasPosition CPred where
     getPosition (CPred c ts) = getPosition (c, ts)
 
 data CQType = CQType [CPred] CType
-    deriving (Eq, Ord, Show)
+    deriving (Eq, Ord, Show, Generic.Data, Generic.Typeable)
 
 instance Hyper CQType where
     hyper (CQType i ts) y = hyper2 i ts y

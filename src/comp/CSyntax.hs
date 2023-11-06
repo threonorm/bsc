@@ -1,4 +1,5 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, DeriveDataTypeable #-}
+ 
 module CSyntax(
         CPackage(..),
         CSignature(..),
@@ -75,6 +76,7 @@ module CSyntax(
 import Prelude hiding ((<>))
 
 
+import Data.Generics qualified as DataGenerics
 import Data.Char(isAlpha)
 import Data.List(intercalate, genericReplicate)
 import Eval
@@ -167,7 +169,7 @@ data CDefn
         | CItype IdK [Id] [Position] -- positions of use that caused export
         | CIclass (Maybe Bool) [CPred] IdK [Id] CFunDeps [Position] -- positions of use that caused export
         | CIValueSign Id CQType
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 -- Since IdPKind is only expected in some disjuncts of CDefn, we could
 -- create a separate IdPK for those cases, but that seems like overkill.
@@ -177,7 +179,7 @@ data IdK
         | IdKind Id Kind
         -- this should not exist after typecheck
         | IdPKind Id PartialKind
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 type CFunDeps = [([Id],[Id])]
 
@@ -258,7 +260,7 @@ data CExpr
         | CTApply CExpr [CType]
         -- for passing pprops as values
         | Cattributes [(Position,PProp)]
-        deriving (Ord, Show)
+        deriving (Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 -- Useful to know where modules are being defined, as module define structs
 extractStructT :: CExpr -> [CExpr]
@@ -512,7 +514,7 @@ xCmoduleVerilog m is_user_import wireinfo args fields schedinfo pathinfo =
 
 -- ===============
 
-data CLiteral = CLiteral Position Literal deriving (Show)
+data CLiteral = CLiteral Position Literal deriving (Show,  DataGenerics.Data, DataGenerics.Typeable)
 instance Eq CLiteral where
         CLiteral _ l == CLiteral _ l'  =  l == l'
 instance Ord CLiteral where
@@ -521,7 +523,7 @@ instance Ord CLiteral where
 data COp
         = CRand CExpr    -- operand
         | CRator Int Id  -- infix operator Id, Int is the number of arguments?
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 type CSummands = [CInternalSummand]
 
@@ -534,7 +536,7 @@ data CInternalSummand =
     CInternalSummand { cis_names :: [Id],
                        cis_arg_type :: CType,
                        cis_tag_encoding :: Integer }
-    deriving (Eq, Ord, Show)
+    deriving (Eq, Ord, Show,  DataGenerics.Data, DataGenerics.Typeable)
 
 -- return only the primary name
 getCISName :: CInternalSummand -> Id
@@ -555,7 +557,7 @@ data COriginalSummand =
                        cos_arg_types :: [CQType],
                        cos_field_names :: Maybe [Id],
                        cos_tag_encoding :: Maybe Integer }
-    deriving (Eq, Ord, Show)
+    deriving (Eq, Ord, Show,  DataGenerics.Data, DataGenerics.Typeable)
 
 -- return only the primary name
 getCOSName :: COriginalSummand -> Id
@@ -571,7 +573,7 @@ data CField = CField { cf_name :: Id,
                        cf_default :: [CClause],
                        cf_orig_type :: Maybe CType
                      }
-              deriving (Eq, Ord, Show)
+              deriving (Eq, Ord, Show,  DataGenerics.Data, DataGenerics.Typeable)
 
 type CFields = [CField] -- just a list of CField
 
@@ -580,7 +582,7 @@ type CFields = [CField] -- just a list of CField
 data CCaseArm = CCaseArm { cca_pattern :: CPat,
                            cca_filters :: [CQual],
                            cca_consequent :: CExpr }
-              deriving (Eq, Ord, Show)
+              deriving (Eq, Ord, Show,  DataGenerics.Data, DataGenerics.Typeable)
 
 type CCaseArms = [CCaseArm] -- [(CPat, [CQual], CExpr)]
 
@@ -593,7 +595,7 @@ data CStmt
                            --   before current let or in earlier arm
         | CSletrec [CDefl] -- rhs of "let x = x" refers to self
         | CSExpr (Maybe CExpr) CExpr
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 bindVarT :: Id -> CType -> CExpr -> CStmt
 bindVarT i t e = CSBindT (CPVar i) Nothing [] (CQType [] t) e
@@ -605,12 +607,12 @@ data CMStmt
         | CMrules CExpr
         | CMinterface CExpr
         | CMTupleInterface Position [CExpr]
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 data CRule
         = CRule [RulePragma] (Maybe CExpr) [CQual] CExpr
         | CRuleNest [RulePragma] (Maybe CExpr) [CQual] [CRule]
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 -- | A definition with a binding. Can occur as a let expression, let statement
 -- in a do block, a typeclass instance defn, or bindings in an interface.
@@ -619,13 +621,13 @@ data CDefl                -- [CQual] part is the when clause used in an interfac
         = CLValueSign CDef [CQual]     -- let x :: T = e2 -- explicit type sig
         | CLValue Id [CClause] [CQual] -- let y = e2      -- no explicit type sig
         | CLMatch CPat CExpr           -- let [z] = e3
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 -- Definition, local or global
 data CDef
         = CDef Id CQType [CClause]                        -- before type checking
         | CDefT Id [TyVar] CQType [CClause]                -- after type checking, with type variables from the CQType
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 -- Definition clause
 -- each interface's definitions (within the module) correspond to one of these
@@ -633,13 +635,13 @@ data CClause
         = CClause [CPat]                -- arguments (including patterns)
                   [CQual]               -- qualifier on the args
                   CExpr                 -- the body
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show,  DataGenerics.Data, DataGenerics.Typeable)
 
 -- Pattern matching
 data CQual
         = CQGen CType CPat CExpr
         | CQFilter CExpr
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 isCQFilter :: CQual -> Bool
 isCQFilter (CQFilter _) = True
@@ -665,12 +667,12 @@ data CPat
         | CPCon1 Id Id CPat                        -- first Id is type of constructor
         -- After type checking
         | CPConTs Id Id [CType] [CPat]
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show,  DataGenerics.Data, DataGenerics.Typeable)
 
 data CPOp
         = CPRand CPat
         | CPRator Int Id
-        deriving (Eq, Ord, Show)
+        deriving (Eq, Ord, Show, DataGenerics.Data, DataGenerics.Typeable)
 
 newtype CInclude
        = CInclude String

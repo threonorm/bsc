@@ -139,13 +139,14 @@ PACKAGES = \
 	-package split \
 	-package syb \
 	-package integer-gmp \
-	-package text \
+	-package text \ #After that, dependencies for bsc-lsp
 	-package lsp \
 	-package lsp-test \
 	-package lsp-types \
 	-package lens \
 	-package aeson \
 	-package text-format \
+	-package uniplate \ #Maybe as BSC already depends on SYB we should use that?
 	$(GHCEXTRAPKGS)
 
 # GHC can compile either a single file (use GHCCOMPILEFLAGS) or
