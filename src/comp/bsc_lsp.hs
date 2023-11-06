@@ -284,10 +284,8 @@ updateNametable doc maybepackage cpackage =
                                                             -- (\x -> definedNames x ++ getIdStructs x)
                                                             definedNames
                                                             defs) defs_public_aux
-                            -- fulldefs_local = fromMaybe [] ((\(CPackage _ _ _ _ defns _) -> defns) <$> cpackage )
-                            -- defs_local = L.concatMap definedNames fulldefs_local
-                            -- method_local_defs = L.concatMap getIdStructs fulldefs_local
-                            all_defs = defs_public -- Might contain duplicate
+                            fulldefs_local = (\(CPackage _ _ _ _ defns _) -> L.concatMap definedNames defns) c
+                            all_defs = fulldefs_local ++ defs_public -- Might contain duplicate
                         -- logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> Pp.pp80 defns) cpackage
                         liftIO . modifyMVar_ stRef $ \x ->
                                                     return $ x{visible_global_identifiers = M.insert
