@@ -103,19 +103,18 @@ import Data.Yaml qualified as Yaml
 import Data.Either qualified as Either
 -- Current limitations: 
 
---  Errors are at the line level (no multiline errors, no
---      end of column error).
---  bsc_lsp is singlethreaded
---  TODO: Return the package and the name table as best as possible even if compilation fail (currently returns nothing)
---  TODO: Currently points to the type definition for methods, instead of the module instantiation. 
+--  - Errors are at the line level (no multiline errors, no end of column error).
+--  - bsc_lsp is singlethreaded
+--  - TODO: Return the package and the name table as best as possible even if compilation fail (currently returns nothing)
+--  - TODO: Currently points to the type definition for methods, instead of the module instantiation. 
 --     Maybe that should be the behavior for getting the types, but for the definition it should be
 --     The actual definition?
---  IN PROGRESS: How to get local definitions?
---  Go to [instance.subinterface1.subsub.method]  in general this is very
+--  - IN PROGRESS: How to get local definitions?
+--  - Go to [instance.subinterface1.subsub.method]  in general this is very
 --     difficult. Already instance.method() is tricky as we would need to know
 --     the line where method is defined -> Maybe special case it as it would be
 --     quite useful? -> Call the frontend for the subfile to find the position
---     of the method
+--     of the method. Investigate if we can interact between the js extension and the haskell
 
 getPreviousPosFromParsedPackage :: Id -> CPackage -> [Id]
 getPreviousPosFromParsedPackage pos (CPackage _ _ _ _ defns _) = 
