@@ -118,11 +118,6 @@ import Data.Generics qualified as DataGenerics
 --     quite useful? -> Call the frontend for the subfile to find the position
 --     of the method
 
-
--- Strawman to get some number of local definitions manually
--- TODO get more, right now we only gather some local module instances and
--- module parameters We don't go down in rules as it is painful to find
-
 isSameIdBefore :: Id -> Id -> Bool
 isSameIdBefore current target = 
     current == target && getPositionLine (getIdPosition current) <= getPositionLine (getIdPosition target)
@@ -130,72 +125,72 @@ isSameIdBefore current target =
 
 getPreviousPosFromParsedPackage :: Id -> CPackage -> [Id]
 getPreviousPosFromParsedPackage pos (CPackage _ _ _ _ defns _) = 
-    -- TODO limitation currently will potentially return unrelated definitions in previous
-    -- modules of the package, we should only keep the defns which contains the pos
-    -- TODO to make that easier it would be good to write a function
-    -- that returns the (minpos, maxpos) in an arbitrary piece of CSyntax
     concatMap (pruneLocalCDefn pos) defns
 
-collectPositions :: CExpr -> [Position]
-collectPositions = DataGenerics.listify isP
+-- -- Currently unused:
+-- collectPositionsCExpr  :: CExpr -> [Position]
+-- collectPositionsCExpr  = DataGenerics.listify isP
+--   where isP p = True
+
+collectPositionsCDefn :: CDefn -> [Position]
+collectPositionsCDefn = DataGenerics.listify isP
   where isP p = True
 
--- Investigate if we can do all the following with SYB
+
+within :: Int -> [ Position ] -> Bool
+within line [] = False
+within line l =
+    line >= minimum l' && line <= maximum l'
+    where 
+        l' = getPositionLine <$> l
+
+-- Ids1, Ids2 and Ids3 are to focus only on definition/redefinitions one per type that can define stuff
+collectIds1 :: CDefn -> [Id]
+collectIds1 = DataGenerics.everything 
+    (++)
+    (DataGenerics.mkQ [] test)
+    --No need to do CDefT as we are pretypechecking?
+    where 
+        test cdef@(CDef id _ _) = [id]
+        test _ = []
+
+collectIds2 :: CDefn -> [Id]
+collectIds2 = DataGenerics.everything 
+    (++)
+    (DataGenerics.mkQ [] test)
+    where
+        test cdef@(CPVar x) = [x]
+        test _ = []
+
+collectIds3 :: CDefn -> [Id]
+collectIds3 = DataGenerics.everything 
+    (++)
+    (DataGenerics.mkQ [] test)
+    where 
+        test cdef@(CLValue x _ _) = [x]
+        test _ = []
+
+
+-- Currently unused, could be used for references
+collectIds :: CDefn -> [Id]
+collectIds = DataGenerics.everything 
+    (++)
+    (DataGenerics.mkQ [] (\id -> [id]))
+
+
 pruneLocalCDefn :: Id -> CDefn  -> [Id]
 pruneLocalCDefn pos cdefn =
-    case cdefn of
-        CValueSign cdef ->
-             pruneLocalCDef pos  cdef 
-        _ -> [] 
+    -- Naive implementation here, we do several times the same traversal (1 for position + 3 times for different kinds of ids)
+    -- We contextualize a bit by scoping the search to the current toplevel definition only, but we could still get cross rules pollutions.
+
+    if within (getPositionLine (getPosition pos)) (collectPositionsCDefn cdefn) then 
+        case cdefn of
+            CValueSign cdef ->
+                    L.filter (== pos) $ collectIds1 cdefn ++ collectIds2 cdefn ++ collectIds3 cdefn 
+            _ -> [] 
+    else 
+       []
       
-
-pruneLocalCDef :: Id -> CDef -> [Id]
-pruneLocalCDef pos cdef =
-    case cdef of
-        CDef id cqtype cclauses -> 
-            --  let new = if isSameIdBefore id pos then [id] else [] in 
-            --  new ++ 
-            concatMap (pruneLocalCClause pos) cclauses
-        _ -> [] 
-
-pruneLocalCClause :: Id -> CClause -> [ Id ]
-pruneLocalCClause pos cdefn =
-    case cdefn of 
-        CClause args _ c -> 
-            getIdEqualArgs pos args ++ pruneLocalCExpr pos c
-
-getIdEqualArgs :: Id -> [CPat] -> [Id]
-getIdEqualArgs pos [] = []
-getIdEqualArgs pos ((CPVar x):tl) = ( if x `isSameIdBefore` pos then [x] else [] ) ++ (getIdEqualArgs pos tl)
-getIdEqualArgs pos (_:tl) = (getIdEqualArgs pos tl)
-
-
-pruneLocalCMStmt :: Id -> CMStmt -> [Id]
-pruneLocalCMStmt pos stmt = 
-    case stmt of 
-        CMStmt s -> pruneLocalCStmt pos s 
-        _ -> []
-
-
--- Minimum syndical - try to find just the definitions of instances in modules
-pruneLocalCStmt :: Id -> CStmt -> [Id]
-pruneLocalCStmt pos stmt = 
-    case stmt of 
-        CSBindT (CPVar x) _ _ t rhs -> if x `isSameIdBefore` pos then [x] else []
-        CSBind (CPVar x) _ _ rhs -> if x `isSameIdBefore` pos then [x] else []
-        CSletseq [CLValue x cclauses _] -> if x `isSameIdBefore` pos then [x] else []
-        _ -> []
-
-
-
-pruneLocalCExpr :: Id -> CExpr -> [Id]
-pruneLocalCExpr pos cexpr  =  
-    case cexpr of 
-        Cmodule _ cmstmts -> concatMap (pruneLocalCMStmt pos) cmstmts 
-        _ -> []
-
-
-
 
 -- TODO EASY: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
@@ -203,26 +198,18 @@ pruneLocalCExpr pos cexpr  =
 data Config = Config {bscExe :: FilePath}
   deriving (Generic, J.ToJSON, J.FromJSON, Show)
 
--- TODO bsv_exe should be provided by the LSP client
+-- Next three variables should never be used anyway as they should come from extension
 bscExeDefault :: FilePath
 bscExeDefault = "bsc"
 
--- TODO bsvUserDir should be provided by the LSP client in the future
 bsvUserDir :: [String]
 bsvUserDir = []
-
-pathBsvLibs :: Config -> String
-pathBsvLibs cfg = Monad.join . L.intersperse ":" $ bsvUserDir ++ ["+"]
 
 bscExtraArgs :: [String]
 bscExtraArgs = []
 
--- TODO create the directory if it does not exist otherwise it crashes the LSP server
--- In the future, the build folder should be chosen by the LSP client.
--- As it uses standard BO file, it *might* make sense to reuse the project build
--- folder, more thought are needed.
-buildDirDefault :: FilePath
-buildDirDefault = "/tmp/build_bsc/"
+pathBsvLibs :: Config -> String
+pathBsvLibs cfg = Monad.join . L.intersperse ":" $ bsvUserDir ++ ["+"]
 
 
 -- Every options passed to Bluespec except the filename, and [-u] in the case
@@ -280,7 +267,7 @@ getIdStructs x = concat $ case x of
 
 updateNametable :: LSP.Uri -> Maybe (BinMap HeapData) -> Maybe CPackage-> LspState ()
 updateNametable doc maybepackage cpackage =
-    -- This function sssumes that if [maybepackage] is Nothing, then [cpackage]
+    -- This function assumes that if [maybepackage] is Nothing, then [cpackage]
     -- is also Nothing (Both datastructure should be Nothing simultaneously)
     Monad.forM_ cpackage (\c -> 
         Monad.forM_ maybepackage (\m -> do
@@ -292,8 +279,10 @@ updateNametable doc maybepackage cpackage =
                                                             definedNames
                                                             defs) defs_public_aux
                             fulldefs_local = (\(CPackage _ _ _ _ defns _) -> L.concatMap definedNames defns) c
+                            fulldefs_local_pos = (\(CPackage _ _ _ _ defns _) -> L.concatMap collectPositionsCDefn  defns) c
+
                             all_defs = fulldefs_local ++ defs_public -- Might contain duplicate
-                        -- logForClient . T.pack $  L.concatMap (\(CPackage _ _ _ _ defns _) -> Pp.pp80 defns) cpackage
+                        logForClient . T.pack $  show fulldefs_local_pos
                         liftIO . modifyMVar_ stRef $ \x ->
                                                     return $ x{visible_global_identifiers = M.insert
                                                                     doc all_defs (visible_global_identifiers x),
@@ -302,10 +291,10 @@ updateNametable doc maybepackage cpackage =
 type LspState = LspT Config (ReaderT (MVar ServerState) IO)
 
 data ServerState = ServerState {
-    -- Currently easy implementation for global identifiers, 
-    -- To avoid ambiguities of goto definitions because different
-    -- packages could import packages that define the same identifier
-    -- we keep one Id position table per Uri defined
+    -- Currently easy implementation for global identifiers, To avoid
+    -- ambiguities of definitions because different files could use different
+    -- subpackages that could import the same identifier we keep one global Id
+    -- position table per Uri defined
 
     -- TODO: This loose sharing when a module is imported twice,  see if we can
     -- maintain a single map Id -> Position
@@ -313,6 +302,7 @@ data ServerState = ServerState {
     -- keep the old mapping or delete it? 
     -- Currently leaning toward keeping the old mapping.
     visible_global_identifiers :: M.Map LSP.Uri [Id],
+    -- Following currently unused
     typeId :: M.Map LSP.Uri (M.Map Id Id),
     parsedByUri :: M.Map LSP.Uri CPackage,
     buildDir :: FilePath
@@ -323,7 +313,6 @@ data ServerState = ServerState {
     -- TODO Add Uri -> NonGlobalDefinitions even for broken files
     -- TODO Add all references to Id? Id -> [(Uri, Position)]
     -- TODO Type definitions vs value definitions.
-    -- Constructor are type definitions
 }
 
 idAtPos :: LSP.Position -> T.Text -> Maybe (Int, (Int, Int), T.Text)
@@ -365,11 +354,10 @@ getWorkspace = do
             servState <- liftIO $ readMVar stRef
             return $ buildDir servState
 
--- handlers :: Handlers (LspM Config)
 handlers :: Handlers LspState
 handlers =
   mconcat
---   Add handler for completion
+-- TODO Add handler for contextual completion (should be easy?)
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
         cfg <- getConfig
         root <- getRootPath
@@ -463,7 +451,9 @@ handlers =
                         Nothing ->
                             responder . Right $ LSP.InR $ LSP.InL []
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
+
     , requestHandler LSP.SMethod_TextDocumentSignatureHelp $ \req responder -> do
+        -- TODO
         let pos = req ^. LSP.params . LSP.position -- pos is a position in the document
             doc = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
         withFilePathFromUri doc (\file -> do
@@ -476,15 +466,13 @@ handlers =
                     return ()
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
 
-    -- -- TODO: Investigate if the notion of documentation is understood internally by the BSC compiler
-    -- , requestHandler LSP.SMethod_TextDocumentDocumentSymbol$ \req responder -> do
-
-    -- -- TODO: Don't know what SetTrace is used for, but vscode keeps sending
-    -- those event, so we make a dummy handler.
     , notificationHandler LSP.SMethod_TextDocumentDidClose $ \msg -> do -- Check what is being written
         let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
         -- TODO: free the data corresponding to the file?
         return ()
+
+    -- TODO: Don't know what SetTrace is used for, but vscode keeps sending
+    -- those event, so we make a dummy handler.
     , notificationHandler LSP.SMethod_SetTrace $ \msg -> do
         return ()
     ]
