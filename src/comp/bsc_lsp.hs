@@ -13,7 +13,7 @@ import System.Exit(ExitCode(ExitSuccess))
 import System.FilePath(takeBaseName)
 import System.IO
     ( openFile,
-      IOMode(AppendMode, WriteMode),
+      IOMode(AppendMode),
       stdout,
       hPutStr,
       stderr,
@@ -26,7 +26,7 @@ import System.Directory
     ( removeFile,
       getCurrentDirectory,
       createDirectoryIfMissing )
-import Data.Maybe(isJust, catMaybes, fromJust, fromMaybe)
+import Data.Maybe(isJust, fromJust, fromMaybe)
 
 import PreStrings(fsEmpty)
 import Control.Monad(when)
@@ -60,7 +60,6 @@ import Error(ErrorHandle, ExcepWarnErr(..),
 import Position(Position (..),
         getPositionLine,
         getPositionFile,
-        getPositionColumn,
         mkPosition)
 import CVPrint
 import Id
@@ -91,17 +90,17 @@ import Control.Lens ((^.), to) -- Convenient
 import Data.Aeson qualified as J
 import GHC.IO(catchException)
 import Control.Monad.Reader (ReaderT, runReaderT, ask)
-import Control.Concurrent.MVar (MVar, newMVar, readMVar, putMVar, modifyMVar_)
+import Control.Concurrent.MVar (MVar, newMVar, readMVar, modifyMVar_)
 
 import Data.List qualified as L
 import Control.Monad qualified as Monad
 import PPrint qualified as P
 import GHC.Generics (Generic)
-import CSyntax (extractStructTDelf, extractStructTDef)
-import qualified PFPrint as Pp
+-- import qualified PFPrint as Pp
 import Data.Aeson.Types (parse)
 import Data.Generics qualified as DataGenerics
-
+import Data.Yaml qualified as Yaml
+import Data.Either qualified as Either
 -- Current limitations: 
 --  1. Errors are at the line level (no multiline errors, no
 --  end of column error).
@@ -118,19 +117,10 @@ import Data.Generics qualified as DataGenerics
 --     quite useful? -> Call the frontend for the subfile to find the position
 --     of the method
 
-isSameIdBefore :: Id -> Id -> Bool
-isSameIdBefore current target = 
-    current == target && getPositionLine (getIdPosition current) <= getPositionLine (getIdPosition target)
-
-
 getPreviousPosFromParsedPackage :: Id -> CPackage -> [Id]
 getPreviousPosFromParsedPackage pos (CPackage _ _ _ _ defns _) = 
     concatMap (pruneLocalCDefn pos) defns
 
--- -- Currently unused:
--- collectPositionsCExpr  :: CExpr -> [Position]
--- collectPositionsCExpr  = DataGenerics.listify isP
---   where isP p = True
 
 collectPositionsCDefn :: CDefn -> [Position]
 collectPositionsCDefn = DataGenerics.listify isP
@@ -142,7 +132,7 @@ within line [] = False
 within line l =
     line >= minimum l' && line <= maximum l'
     where 
-        l' = getPositionLine <$> l
+        l' = L.filter (/= -1) $ getPositionLine <$> l
 
 -- Ids1, Ids2 and Ids3 are to focus only on definition/redefinitions one per type that can define stuff
 collectIds1 :: CDefn -> [Id]
@@ -172,18 +162,17 @@ collectIds3 = DataGenerics.everything
 
 
 -- Currently unused, could be used for references
-collectIds :: CDefn -> [Id]
-collectIds = DataGenerics.everything 
-    (++)
-    (DataGenerics.mkQ [] (\id -> [id]))
+-- collectIds :: CDefn -> [Id]
+-- collectIds = DataGenerics.everything 
+--     (++)
+--     (DataGenerics.mkQ [] (\id -> [id]))
 
 
 pruneLocalCDefn :: Id -> CDefn  -> [Id]
 pruneLocalCDefn pos cdefn =
     -- Naive implementation here, we do several times the same traversal (1 for position + 3 times for different kinds of ids)
     -- We contextualize a bit by scoping the search to the current toplevel definition only, but we could still get cross rules pollutions.
-
-    if within (getPositionLine (getPosition pos)) (collectPositionsCDefn cdefn) then 
+    if within (getPositionLine $ getPosition pos) $ collectPositionsCDefn cdefn then 
         case cdefn of
             CValueSign cdef ->
                     L.filter (== pos) $ collectIds1 cdefn ++ collectIds2 cdefn ++ collectIds3 cdefn 
@@ -195,32 +184,26 @@ pruneLocalCDefn pos cdefn =
 -- TODO EASY: For the project-level variables (pathBsvLibs, bscExtraArgs), maybe the easiest is to simply
 -- pass a [bsv_lsp.yaml] file to do all those configuration at the project level
 
-data Config = Config {bscExe :: FilePath}
-  deriving (Generic, J.ToJSON, J.FromJSON, Show)
+data Config = Config {bscExe :: FilePath, projectFile :: FilePath }
+    deriving (Generic, J.ToJSON, J.FromJSON, Show)
 
--- Next three variables should never be used anyway as they should come from extension
-bscExeDefault :: FilePath
-bscExeDefault = "bsc"
+data ProjectConfig = ProjectConfig { bscExtraArgs :: [String], bsvUserDirs :: [String]} 
+    deriving (Generic, Show, J.ToJSON, J.FromJSON)
 
-bsvUserDir :: [String]
-bsvUserDir = []
+defaultProjectConfig :: ProjectConfig
+defaultProjectConfig = ProjectConfig { bscExtraArgs = [], bsvUserDirs = []}
 
-bscExtraArgs :: [String]
-bscExtraArgs = []
-
-pathBsvLibs :: Config -> String
-pathBsvLibs cfg = Monad.join . L.intersperse ":" $ bsvUserDir ++ ["+"]
-
+pathBsvLibs :: ProjectConfig -> String
+pathBsvLibs cfg = Monad.join . L.intersperse ":" $ bsvUserDirs cfg ++ ["+"]
 
 -- Every options passed to Bluespec except the filename, and [-u] in the case
 -- where we compile recursively
-commandOptions :: Config -> String -> [String]
-commandOptions cfg builddir = ["--aggressive-conditions"] ++ bscExtraArgs ++ ["-p", pathBsvLibs cfg, "-bdir", builddir]
+commandOptions :: ProjectConfig -> Config -> String -> [String]
+commandOptions pcfg cfg builddir = ["--aggressive-conditions"] ++ bscExtraArgs pcfg ++ ["-p", pathBsvLibs pcfg, "-bdir", builddir]
 
 logForClient :: MonadLsp config f => T.Text -> f ()
 logForClient x = sendNotification LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Log x
 
--- TODO: I did not check how MessageType_Error appear on the vscode side
 errorForClient :: MonadLsp config f => T.Text -> f ()
 errorForClient x = sendNotification LSP.SMethod_WindowLogMessage $ LSP.LogMessageParams LSP.MessageType_Error x
 
@@ -259,12 +242,6 @@ withFilePathFromUri uri k =
         Just s -> k s
         Nothing -> logForClient . toStrict $ format "URI {} cannot be transformed into Filepath" (Only (show uri))
 
--- getIdStruct :: -> [Id]
-getIdStructs :: CDefn -> [Id]
-getIdStructs x = concat $ case x of
-     CValueSign l ->  (\(CStructT t v) -> fst <$> v) <$> extractStructTDef l
-     _ -> []
-
 updateNametable :: LSP.Uri -> Maybe (BinMap HeapData) -> Maybe CPackage-> LspState ()
 updateNametable doc maybepackage cpackage =
     -- This function assumes that if [maybepackage] is Nothing, then [cpackage]
@@ -279,10 +256,10 @@ updateNametable doc maybepackage cpackage =
                                                             definedNames
                                                             defs) defs_public_aux
                             fulldefs_local = (\(CPackage _ _ _ _ defns _) -> L.concatMap definedNames defns) c
-                            fulldefs_local_pos = (\(CPackage _ _ _ _ defns _) -> L.concatMap collectPositionsCDefn  defns) c
-
+                            -- fulldefs_local_pos = (\(CPackage _ _ _ _ defns _) -> collectPositionsCDefn  <$> defns) c
                             all_defs = fulldefs_local ++ defs_public -- Might contain duplicate
-                        logForClient . T.pack $  show fulldefs_local_pos
+                            -- pos_defs =  (\l -> (minimum l, maximum l)) <$> fmap getPositionLine <$> fulldefs_local_pos
+                        -- logForClient . T.pack $  show $ pos_defs
                         liftIO . modifyMVar_ stRef $ \x ->
                                                     return $ x{visible_global_identifiers = M.insert
                                                                     doc all_defs (visible_global_identifiers x),
@@ -296,8 +273,6 @@ data ServerState = ServerState {
     -- subpackages that could import the same identifier we keep one global Id
     -- position table per Uri defined
 
-    -- TODO: This loose sharing when a module is imported twice,  see if we can
-    -- maintain a single map Id -> Position
     -- TODO: UI question - what to do when file does not compile, should we 
     -- keep the old mapping or delete it? 
     -- Currently leaning toward keeping the old mapping.
@@ -305,7 +280,8 @@ data ServerState = ServerState {
     -- Following currently unused
     typeId :: M.Map LSP.Uri (M.Map Id Id),
     parsedByUri :: M.Map LSP.Uri CPackage,
-    buildDir :: FilePath
+    buildDir :: FilePath,
+    projectConfig :: ProjectConfig
     -- We are missing the definitions here
 
     -- In the future, this type should carry:
@@ -360,19 +336,24 @@ handlers =
 -- TODO Add handler for contextual completion (should be easy?)
     [ notificationHandler LSP.SMethod_Initialized $ \_not -> do
         cfg <- getConfig
+        -- Read the Yaml file
         root <- getRootPath
+        stRef <- lift ask
         case root of
          Just root -> do
+            (yaml :: Either.Either Yaml.ParseException ProjectConfig) <- liftIO . Yaml.decodeFileEither $ root ++ "/" ++ projectFile cfg 
+            logForClient . toStrict $ format "Trying to read the yaml file {} {} " ( root ++ "/" ++ projectFile cfg, show yaml)
+            let pcfg = Either.fromRight defaultProjectConfig yaml
             let workspace = root ++ "/.bsclsp"
             liftIO $ createDirectoryIfMissing True workspace
-            stRef <- lift ask
-            liftIO . modifyMVar_ stRef $ \x -> return $ x{buildDir= workspace}
+            liftIO . modifyMVar_ stRef $ \x -> return $ x{buildDir= workspace, projectConfig = pcfg}
             logForClient . toStrict $ format "BSC LSP Server Initialized {} workspace {} " (show cfg, root)
          Nothing -> do
+
+            logForClient . toStrict $ "No root found - defaulting to empty yaml file"
             let workspace = "/tmp/.globalbsclsp"
             liftIO $ createDirectoryIfMissing True workspace
-            stRef <- lift ask
-            liftIO . modifyMVar_ stRef $ \x -> return $ x{buildDir= workspace}
+            liftIO . modifyMVar_ stRef $ \x -> return $ x{buildDir= workspace, projectConfig= defaultProjectConfig}
     , notificationHandler LSP.SMethod_WorkspaceDidChangeConfiguration $ \_dummy -> do
         -- See Note about LSP configuration in the haskell lsp package
         return ()
@@ -386,7 +367,11 @@ handlers =
 
             -- First we call the fullblown compiler recursively, to get the [.bo]
             -- files of the submodules and then
-            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg workspace ++ [ "-u", file ]) ""
+
+            stRef <- lift ask
+            pcfg <- liftIO $ projectConfig <$> readMVar stRef
+
+            (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions pcfg cfg workspace ++ [ "-u", file ]) ""
 
             -- Independently of the success of the previous step (technically we
             -- could skip it if the previous step was successful) we call the
@@ -395,7 +380,7 @@ handlers =
             -- importing submodules, typechecking, etc...), an exception is
             -- raised by the compiler.  We catch this exception here  and we
             -- display it as diagnostic
-            (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg workspace ++ [file])  (T.unpack content)) $
+            (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions pcfg cfg workspace ++ [file])  (T.unpack content)) $
                                                 return . diagFromExcep
             diagsForClient doc $ diagErrs ++ diagWarns
             updateNametable doc maybeNameTable maybePackage)
@@ -407,7 +392,9 @@ handlers =
             cfg <- getConfig
             case mdoc of
                 Just vf@(VFS.VirtualFile _ version rope) -> do
-                    (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg workspace ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                    stRef <- lift ask
+                    pcfg <- liftIO $ projectConfig <$> readMVar stRef
+                    (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions pcfg cfg workspace ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                     diagsForClient doc (diagErrs ++ diagWarns)
                     updateNametable doc maybeNameTable maybePackage
@@ -420,10 +407,13 @@ handlers =
             cfg <- getConfig
             case mdoc of
               Just vf@(VFS.VirtualFile _ version _rope) -> do
-                (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions cfg workspace ++ [file]) ""
+
+                stRef <- lift ask
+                pcfg <- liftIO $ projectConfig <$> readMVar stRef
+                (errCode, stdout', stderr') <- liftIO $ readProcessWithExitCode (bscExe cfg) (commandOptions pcfg cfg workspace ++ [file]) ""
                 -- Delete stale BO file as the new source is broken 
                 when (errCode /= ExitSuccess) . liftIO $ removeFile (workspace ++ takeBaseName file ++ ".bo")
-                (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions cfg workspace ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
+                (diagErrs, diagWarns, maybeNameTable, maybePackage) <- liftIO $ catchException (emptyDiags <$> hmain (commandOptions pcfg cfg workspace ++ [file])  (T.unpack (VFS.virtualFileText vf))) $
                                                 return . diagFromExcep
                 diagsForClient doc (diagErrs ++ diagWarns)
                 updateNametable doc maybeNameTable maybePackage
@@ -442,7 +432,7 @@ handlers =
                         Just ids -> do
                             let add_key = (\id -> (getIdBase id, id)) <$> ids
                                 searched = idAtPos pos (VFS.virtualFileText vf)
-                                (line, (colbegin,colend), idname) = fromMaybe (-1, (-1,-1), "_unused_42") $ searched
+                                (line, (colbegin,_colend), idname) = fromMaybe (-1, (-1,-1), "_unused_42") $ searched
                                 find_ids_glob = snd <$> L.filter (\(key,v) -> toString key == T.unpack idname) add_key
                                 find_ids_local = getPreviousPosFromParsedPackage (mkId (mkPosition fsEmpty line colbegin ) .  fromString $ T.unpack idname) . 
                                                     fromMaybe (CPackage undefined undefined undefined undefined [] undefined) $ M.lookup doc $ parsedByUri serverState
@@ -454,7 +444,7 @@ handlers =
 
     , requestHandler LSP.SMethod_TextDocumentSignatureHelp $ \req responder -> do
         -- TODO
-        let pos = req ^. LSP.params . LSP.position -- pos is a position in the document
+        let _pos = req ^. LSP.params . LSP.position -- pos is a position in the document
             doc = req ^. LSP.params . LSP.textDocument . LSP.uri -- uri is the link of the document
         withFilePathFromUri doc (\file -> do
             mdoc <- getVirtualFile (doc ^. to LSP.toNormalizedUri)
@@ -467,7 +457,7 @@ handlers =
               Nothing -> errorForClient . toStrict $ format "No virtual file found for {} " (Only file))
 
     , notificationHandler LSP.SMethod_TextDocumentDidClose $ \msg -> do -- Check what is being written
-        let doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
+        let _doc = msg ^. LSP.params . LSP.textDocument . LSP.uri
         -- TODO: free the data corresponding to the file?
         return ()
 
@@ -481,7 +471,11 @@ handlers =
 
 initialServerState :: IO (MVar ServerState)
 initialServerState = do
-    newMVar ServerState{ visible_global_identifiers = M.empty, buildDir = "/tmp/.globalbsclsp", typeId = M.empty, parsedByUri = M.empty }
+    newMVar ServerState{ visible_global_identifiers = M.empty, 
+    buildDir = "/tmp/.globalbsclsp", 
+    typeId = M.empty, 
+    parsedByUri = M.empty,
+    projectConfig = defaultProjectConfig }
 
 runLSPAndState :: LspState a  -> MVar ServerState -> LanguageContextEnv Config ->  IO a
 runLSPAndState lsp state env = runReaderT (runLspT env lsp) state
@@ -498,7 +492,7 @@ main = do
                                                             J.Success v -> Right v
                                                             J.Error err -> Left $ T.pack err
                          , onConfigChange = const $ pure ()
-                         , defaultConfig = Config {bscExe = bscExeDefault }
+                         , defaultConfig = Config {bscExe = "", projectFile = "" }
                          , configSection = "glspc.initializationOptions" -- TODO investigate what this configSection is suppose to do
                          , doInitialize = \env _req -> pure $ Right env
                          , staticHandlers = const handlers

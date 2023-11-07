@@ -146,6 +146,7 @@ PACKAGES = \
 	-package lens \
 	-package aeson \
 	-package text-format \
+	-package yaml\
 	$(GHCEXTRAPKGS)
 
 # GHC can compile either a single file (use GHCCOMPILEFLAGS) or
