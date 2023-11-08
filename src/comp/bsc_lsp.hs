@@ -315,7 +315,7 @@ findWordBoundaries position text = do
     return (position - start, end)
 
 isWordChar :: Char -> Bool
-isWordChar c = c `elem` ['a'..'z'] || c `elem` ['A'..'Z'] || c `elem` ['0'..'9']
+isWordChar c = c `elem` ['a'..'z'] || c `elem` ['A'..'Z'] || c `elem` ['0'..'9'] || c `elem` ['_']
 
 bscPosToLSPPos :: (Int, (Int,Int)) -> Position -> LSP.DefinitionLink
 bscPosToLSPPos (l ,(start,end)) pos =
