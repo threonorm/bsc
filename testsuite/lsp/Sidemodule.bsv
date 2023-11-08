@@ -1,4 +1,7 @@
+import Vector::*;
+
 typedef Bit#(32) TestType;
+
 typedef struct { Bit#(32) foo; } Bar deriving (Eq);
 
 typedef struct { a yo; } Maybe#(type a);
@@ -9,6 +12,8 @@ interface MyInterface;
 endinterface
 
 module mkMyInterface(MyInterface);
+    Vector#(2, Reg#(Bit#(32))) d <- replicateM(mkReg(0));
+
     method Action foo();
         noAction;
     endmethod
